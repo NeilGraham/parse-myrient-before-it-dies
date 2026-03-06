@@ -38,8 +38,13 @@ from rich.progress import (
 )
 from rich.prompt import Confirm
 
+from urllib.parse import quote
+
 sys.path.insert(0, str(Path(__file__).parent))
 from stats import collect_stats, fmt_size, resolve_root  # noqa: E402
+
+BASE_URL = "https://myrient.erista.me/files/"
+OUTPUT_ROOT = Path("files")
 
 DEFAULT_WORKERS = 4
 MAX_ATTEMPTS = 5       # total attempts per file before giving up (includes re-queues)
@@ -68,7 +73,7 @@ def run_crawl(root: Path) -> None:
     console.print(f"[bold cyan]Ensuring metadata is up to date:[/] {root.resolve()}\n")
     script = Path(__file__).parent / "crawl.py"
     subprocess.run(
-        [sys.executable, str(script), "--paths", str(root)],
+        ["uv", "run", str(script), "--paths", str(root)],
         check=False,
     )
 
@@ -165,6 +170,16 @@ def main() -> None:
 
     root = resolve_root(args.path)
 
+    # Derive the Myrient URL from whichever form was provided
+    if args.path.startswith("http"):
+        myrient_url = args.path if args.path.endswith("/") else args.path + "/"
+    else:
+        try:
+            rel = root.resolve().relative_to(OUTPUT_ROOT.resolve())
+            myrient_url = BASE_URL + "/".join(quote(p, safe="") for p in rel.parts) + "/"
+        except ValueError:
+            myrient_url = BASE_URL
+
     # --- Step 1: Ensure metadata is up to date ---
     run_crawl(root)
 
@@ -177,7 +192,8 @@ def main() -> None:
 
     console.print()
     console.rule("[bold]Download Overview")
-    console.print(f"  [dim]Root        :[/] {root.resolve()}")
+    console.print(f"  [dim]Local path  :[/] {root.resolve()}")
+    console.print(f"  [dim]Myrient URL :[/] {myrient_url}")
     console.print(f"  [dim]Files       :[/] {file_count:,}")
     console.print(f"  [dim]Directories :[/] {dir_count:,}")
     console.print(f"  [dim]Max depth   :[/] {max_depth}")

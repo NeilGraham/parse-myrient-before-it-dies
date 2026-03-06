@@ -14,9 +14,10 @@ Accepts a local files/ path or a Myrient URL as the root to inspect.
 import argparse
 import csv
 import re
+import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 BASE_URL = "https://myrient.erista.me/files/"
 OUTPUT_ROOT = Path("files")
@@ -65,7 +66,7 @@ def resolve_root(path_or_url: str) -> Path:
     if path_or_url.startswith("http"):
         url = path_or_url if path_or_url.endswith("/") else path_or_url + "/"
         rel = url[len(BASE_URL):] if url.startswith(BASE_URL) else ""
-        return OUTPUT_ROOT / Path(rel) if rel else OUTPUT_ROOT
+        return OUTPUT_ROOT / Path(unquote(rel)) if rel else OUTPUT_ROOT
     return Path(path_or_url)
 
 
@@ -148,6 +149,15 @@ def print_tree(node: dict, col_widths: tuple[int, int, int], prefix: str = "", i
 # Entry point
 # ---------------------------------------------------------------------------
 
+def run_crawl(path_or_url: str) -> None:
+    """Run crawl.py against path_or_url to fill any missing metadata."""
+    script = Path(__file__).parent / "crawl.py"
+    subprocess.run(
+        ["uv", "run", str(script), "--paths", path_or_url],
+        check=False,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Myrient directory statistics")
     parser.add_argument(
@@ -158,11 +168,19 @@ def main() -> None:
         help="local files/ path or Myrient URL to inspect (default: files/)",
     )
     parser.add_argument(
+        "--crawl",
+        action="store_true",
+        help="run crawl.py first to fill any missing metadata before reporting stats",
+    )
+    parser.add_argument(
         "--expanded",
         action="store_true",
         help="print full directory tree with per-node file count, dir count, and size",
     )
     args = parser.parse_args()
+
+    if args.crawl:
+        run_crawl(args.path)
 
     root = resolve_root(args.path)
     if not root.exists():
