@@ -2,9 +2,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "selenium",
-#   "webdriver-manager",
 #   "beautifulsoup4",
+#   "requests",
 # ]
 # ///
 """
@@ -16,29 +15,30 @@ Output mirrors the URL structure under ./files/
 Resume-safe: skips any directory that already has a metadata.tsv.
 """
 
+import argparse
 import csv
+import queue
 import sys
+import threading
 import time
 import logging
 import tempfile
 from pathlib import Path
 from urllib.parse import urljoin, unquote
 
+import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 
 BASE_URL = "https://myrient.erista.me/files/"
 OUTPUT_ROOT = Path("files")
-DELAY_SECONDS = 1.0          # polite crawl delay between requests
+DEFAULT_DELAY = 1.0
+DEFAULT_WORKERS = 8
 MAX_RETRIES = 3
 FIELDNAMES = ["File Name", "File Size", "Date", "URL"]
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    format="%(asctime)s  %(levelname)-7s  %(threadName)s  %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -48,20 +48,18 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Selenium driver
+# Thread-local requests session
 # ---------------------------------------------------------------------------
 
-def make_driver() -> webdriver.Chrome:
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (compatible; MyrientCrawler/1.0)"
-    )
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=opts)
+_thread_local = threading.local()
+
+
+def get_session() -> requests.Session:
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.headers["User-Agent"] = "Mozilla/5.0 (compatible; MyrientCrawler/1.0)"
+        _thread_local.session = s
+    return _thread_local.session
 
 
 # ---------------------------------------------------------------------------
@@ -119,15 +117,17 @@ def parse_directory(html: str, page_url: str) -> list[dict]:
 # Fetching with retry
 # ---------------------------------------------------------------------------
 
-def fetch_page(driver: webdriver.Chrome, url: str) -> str | None:
+def fetch_page(url: str, delay: float) -> str | None:
+    session = get_session()
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            driver.get(url)
-            time.sleep(DELAY_SECONDS)
-            return driver.page_source
+            resp = session.get(url, timeout=30)
+            resp.raise_for_status()
+            time.sleep(delay)
+            return resp.text
         except Exception as exc:
             log.warning("Attempt %d/%d failed for %s: %s", attempt, MAX_RETRIES, url, exc)
-            time.sleep(DELAY_SECONDS * attempt)
+            time.sleep(delay * attempt)
     log.error("Giving up on %s after %d attempts", url, MAX_RETRIES)
     return None
 
@@ -151,18 +151,48 @@ def write_tsv(path: Path, rows: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Recursive crawl
+# BFS crawl
 # ---------------------------------------------------------------------------
 
-def crawl(driver: webdriver.Chrome, url: str, out_dir: Path) -> None:
+_visited: set[str] = set()
+_visited_lock = threading.Lock()
+
+
+def mark_visited(url: str) -> bool:
+    """Return True if url is newly marked; False if already seen."""
+    with _visited_lock:
+        if url in _visited:
+            return False
+        _visited.add(url)
+        return True
+
+
+def enqueue_subdirs(rows: list[dict], out_dir: Path, work_queue: queue.Queue) -> None:
+    for row in rows:
+        if row["File Size"] == "-":
+            sub_name = unquote(row["URL"].rstrip("/").split("/")[-1])
+            safe_name = sub_name.replace("\\", "_").replace(":", "_")
+            work_queue.put((row["URL"], out_dir / safe_name))
+
+
+def read_tsv(path: Path) -> list[dict]:
+    with open(path, newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh, delimiter="\t"))
+
+
+def crawl_one(url: str, out_dir: Path, work_queue: queue.Queue, delay: float) -> None:
     tsv_path = out_dir / "metadata.tsv"
 
     if tsv_path.exists():
         log.info("SKIP (already done)  %s", url)
+        enqueue_subdirs(read_tsv(tsv_path), out_dir, work_queue)
+        return
+
+    if not mark_visited(url):
         return
 
     log.info("CRAWL  %s", url)
-    html = fetch_page(driver, url)
+    html = fetch_page(url, delay)
     if html is None:
         return
 
@@ -170,13 +200,19 @@ def crawl(driver: webdriver.Chrome, url: str, out_dir: Path) -> None:
     write_tsv(tsv_path, rows)
     log.info("  -> %d entries written to %s", len(rows), tsv_path)
 
-    # Recurse into subdirectories (File Size == '-' means it's a folder)
-    for row in rows:
-        if row["File Size"] == "-":
-            sub_name = unquote(row["URL"].rstrip("/").split("/")[-1])
-            # Sanitize name for use as a filesystem path component
-            safe_name = sub_name.replace("\\", "_").replace(":", "_")
-            crawl(driver, row["URL"], out_dir / safe_name)
+    enqueue_subdirs(rows, out_dir, work_queue)
+
+
+def worker(work_queue: queue.Queue, delay: float) -> None:
+    while True:
+        item = work_queue.get()
+        if item is None:
+            work_queue.task_done()
+            break
+        try:
+            crawl_one(*item, work_queue=work_queue, delay=delay)
+        finally:
+            work_queue.task_done()
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +220,42 @@ def crawl(driver: webdriver.Chrome, url: str, out_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    log.info("Starting Myrient crawler. Output root: %s", OUTPUT_ROOT.resolve())
-    driver = make_driver()
-    try:
-        crawl(driver, BASE_URL, OUTPUT_ROOT)
-    finally:
-        driver.quit()
+    parser = argparse.ArgumentParser(description="Myrient directory crawler")
+    parser.add_argument(
+        "--workers", type=int, default=DEFAULT_WORKERS, metavar="N",
+        help=f"number of worker threads (1–32, default {DEFAULT_WORKERS})",
+    )
+    parser.add_argument(
+        "--delay", type=float, default=DEFAULT_DELAY, metavar="SEC",
+        help=f"polite delay between requests per thread (default {DEFAULT_DELAY}s)",
+    )
+    args = parser.parse_args()
+    n_workers = max(1, min(32, args.workers))
+    delay = max(0.0, args.delay)
+
+    log.info(
+        "Starting Myrient crawler. workers=%d delay=%.1fs output=%s",
+        n_workers, delay, OUTPUT_ROOT.resolve(),
+    )
+
+    work_queue: queue.Queue = queue.Queue()
+    work_queue.put((BASE_URL, OUTPUT_ROOT))
+
+    threads = [
+        threading.Thread(target=worker, args=(work_queue, delay), name=f"worker-{i+1}", daemon=True)
+        for i in range(n_workers)
+    ]
+    for t in threads:
+        t.start()
+
+    work_queue.join()
+
+    # Send poison pills to shut down worker threads
+    for _ in threads:
+        work_queue.put(None)
+    for t in threads:
+        t.join()
+
     log.info("Done.")
 
 
