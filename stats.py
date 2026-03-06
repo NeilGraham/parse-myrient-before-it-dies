@@ -16,6 +16,7 @@ import csv
 import re
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 BASE_URL = "https://myrient.erista.me/files/"
 OUTPUT_ROOT = Path("files")
@@ -168,9 +169,21 @@ def main() -> None:
         print(f"Error: path does not exist: {root}", file=sys.stderr)
         sys.exit(1)
 
+    # Derive the Myrient URL from whichever form was provided
+    raw = args.path
+    if raw.startswith("http"):
+        myrient_url = raw if raw.endswith("/") else raw + "/"
+    else:
+        try:
+            rel = root.resolve().relative_to(OUTPUT_ROOT.resolve())
+            myrient_url = BASE_URL + "/".join(quote(p, safe="") for p in rel.parts) + "/"
+        except ValueError:
+            myrient_url = BASE_URL
+
     file_count, dir_count, total_bytes, max_depth = collect_stats(root)
 
-    print(f"Root        : {root.resolve()}")
+    print(f"Local path  : {root.resolve()}")
+    print(f"Myrient URL : {myrient_url}")
     print(f"Files       : {file_count:,}")
     print(f"Directories : {dir_count:,}")
     print(f"Max depth   : {max_depth}")
