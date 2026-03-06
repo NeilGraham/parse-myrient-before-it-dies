@@ -13,14 +13,15 @@ Ensures metadata is up to date via crawl.py, shows a stats overview,
 confirms with the user, then downloads all files under the given path.
 
 Resume-safe: skips complete files, resumes .part files via HTTP Range requests.
+Stall-safe: timed-out or dropped connections are re-queued up to MAX_ATTEMPTS times.
 """
 
 import argparse
 import csv
+import queue
 import subprocess
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -41,10 +42,21 @@ sys.path.insert(0, str(Path(__file__).parent))
 from stats import collect_stats, fmt_size, resolve_root  # noqa: E402
 
 DEFAULT_WORKERS = 4
+MAX_ATTEMPTS = 5       # total attempts per file before giving up (includes re-queues)
 CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB
-MAX_RETRIES = 3
 
 console = Console()
+
+# Exceptions that indicate a stall rather than a hard failure
+_STALL_EXCEPTIONS = (
+    requests.Timeout,
+    requests.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+class _Stalled(Exception):
+    """Raised when a download stalls so the caller can re-queue it."""
 
 
 # ---------------------------------------------------------------------------
@@ -87,48 +99,50 @@ def download_file(
     progress: Progress,
     task_id: TaskID,
 ) -> bool:
-    """Download url → dest, using dest.part while in progress. Return True on success."""
+    """
+    Single download attempt for url → dest (.part while in progress).
+    Returns True on success, False on a hard HTTP error.
+    Raises _Stalled on timeout / connection drop so the caller can re-queue.
+    """
     part = Path(str(dest) + ".part")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     session = requests.Session()
     session.headers["User-Agent"] = "Mozilla/5.0 (compatible; MyrientDownloader/1.0)"
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        resume_from = part.stat().st_size if part.exists() else 0
-        headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
+    resume_from = part.stat().st_size if part.exists() else 0
+    headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
 
-        try:
-            resp = session.get(url, headers=headers, stream=True, timeout=60)
+    try:
+        resp = session.get(url, headers=headers, stream=True, timeout=60)
 
-            if resp.status_code == 416:
-                # Server says we already have the whole file
-                part.rename(dest)
-                return True
-
-            resp.raise_for_status()
-
-            content_length = int(resp.headers.get("Content-Length", 0))
-            total = (resume_from + content_length) if content_length else None
-            progress.update(task_id, total=total, completed=resume_from)
-
-            with open(part, "ab" if resume_from else "wb") as fh:
-                for chunk in resp.iter_content(CHUNK_SIZE):
-                    if chunk:
-                        fh.write(chunk)
-                        progress.advance(task_id, len(chunk))
-
+        if resp.status_code == 416:
+            # Server says we already have the whole file
             part.rename(dest)
             return True
 
-        except Exception as exc:
-            if attempt == MAX_RETRIES:
-                progress.console.print(
-                    f"  [red]✗ Failed after {MAX_RETRIES} attempts:[/] {dest.name} — {exc}"
-                )
-                return False
+        resp.raise_for_status()
 
-    return False
+        content_length = int(resp.headers.get("Content-Length", 0))
+        total = (resume_from + content_length) if content_length else None
+        progress.update(task_id, total=total, completed=resume_from)
+
+        with open(part, "ab" if resume_from else "wb") as fh:
+            for chunk in resp.iter_content(CHUNK_SIZE):
+                if chunk:
+                    fh.write(chunk)
+                    progress.advance(task_id, len(chunk))
+
+        part.rename(dest)
+        return True
+
+    except _STALL_EXCEPTIONS as exc:
+        raise _Stalled(str(exc)) from exc
+    except requests.HTTPError:
+        return False
+    except Exception as exc:
+        # Treat unexpected errors as stalls — safer to retry than to discard
+        raise _Stalled(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -192,10 +206,15 @@ def main() -> None:
         console.print("[bold green]  Nothing to download — all files already present![/]")
         sys.exit(0)
 
-    # --- Step 4: Download with rich progress ---
+    # --- Step 4: Download with rich progress and re-queue on stall ---
     completed = already_done
     failed = 0
     lock = threading.Lock()
+
+    # Queue items: (url, local_path, attempt_number)
+    work_q: queue.Queue = queue.Queue()
+    for url, path in pending:
+        work_q.put((url, path, 1))
 
     with Progress(
         SpinnerColumn(),
@@ -213,33 +232,54 @@ def main() -> None:
             completed=already_done,
         )
 
-        def do_download(url: str, dest: Path) -> bool:
+        def worker() -> None:
             nonlocal completed, failed
-            task_id = progress.add_task("file", filename=dest.name, total=None, start=True)
-            ok = download_file(url, dest, progress, task_id)
-            progress.remove_task(task_id)
-            with lock:
-                if ok:
-                    completed += 1
-                    progress.console.print(f"  [green]✓[/] {dest.name}")
-                else:
-                    failed += 1
-                    progress.console.print(f"  [red]✗[/] {dest.name}")
-                progress.update(
-                    overall_task,
-                    completed=completed,
-                    filename=f"[cyan]Overall[/]  {completed}/{len(all_downloads)} files",
-                )
-            return ok
-
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(do_download, url, path): path for url, path in pending}
-            for future in as_completed(futures):
+            while True:
+                item = work_q.get()
+                if item is None:
+                    work_q.task_done()
+                    break
+                url, dest, attempt = item
+                task_id = progress.add_task("file", filename=dest.name, total=None, start=True)
                 try:
-                    future.result()
-                except Exception as exc:
-                    path = futures[future]
-                    progress.console.print(f"  [red]Unexpected error for {path.name}:[/] {exc}")
+                    ok: bool | None = download_file(url, dest, progress, task_id)
+                except _Stalled:
+                    ok = None  # will re-queue if attempts remain
+                progress.remove_task(task_id)
+
+                with lock:
+                    if ok is True:
+                        completed += 1
+                        progress.console.print(f"  [green]✓[/] {dest.name}")
+                    elif ok is None and attempt < MAX_ATTEMPTS:
+                        # Stalled — push back onto the end of the queue
+                        work_q.put((url, dest, attempt + 1))
+                        progress.console.print(
+                            f"  [yellow]↺ Stalled, re-queued[/] {dest.name}"
+                            f"  [dim](attempt {attempt + 1}/{MAX_ATTEMPTS})[/]"
+                        )
+                    else:
+                        failed += 1
+                        label = f"gave up after {MAX_ATTEMPTS} stalls" if ok is None else "hard error"
+                        progress.console.print(f"  [red]✗ {label}:[/] {dest.name}")
+                    progress.update(
+                        overall_task,
+                        completed=completed + failed,
+                        filename=f"[cyan]Overall[/]  {completed + failed}/{len(all_downloads)} files",
+                    )
+                work_q.task_done()
+
+        threads = [
+            threading.Thread(target=worker, name=f"dl-{i+1}", daemon=True)
+            for i in range(n_workers)
+        ]
+        for t in threads:
+            t.start()
+        work_q.join()
+        for _ in threads:
+            work_q.put(None)
+        for t in threads:
+            t.join()
 
     console.print()
     if failed:
