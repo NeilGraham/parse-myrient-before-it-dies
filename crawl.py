@@ -219,6 +219,23 @@ def worker(work_queue: queue.Queue, delay: float) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def resolve_seed(path_or_url: str) -> tuple[str, Path]:
+    """Return (url, out_dir) for a Myrient URL or local files/ path."""
+    if path_or_url.startswith("http"):
+        url = path_or_url if path_or_url.endswith("/") else path_or_url + "/"
+        rel = url[len(BASE_URL):] if url.startswith(BASE_URL) else ""
+        out_dir = OUTPUT_ROOT / Path(unquote(rel)) if rel else OUTPUT_ROOT
+    else:
+        out_dir = Path(path_or_url)
+        try:
+            rel = out_dir.relative_to(OUTPUT_ROOT)
+            url = BASE_URL + "/".join(rel.parts) + "/"
+        except ValueError:
+            # path doesn't start with OUTPUT_ROOT — treat parts as URL suffix
+            url = BASE_URL + "/".join(out_dir.parts) + "/"
+    return url, out_dir
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Myrient directory crawler")
     parser.add_argument(
@@ -229,17 +246,24 @@ def main() -> None:
         "--delay", type=float, default=DEFAULT_DELAY, metavar="SEC",
         help=f"polite delay between requests per thread (default {DEFAULT_DELAY}s)",
     )
+    parser.add_argument(
+        "--paths", nargs="+", metavar="PATH_OR_URL",
+        help="one or more Myrient URLs or local files/ paths to crawl (default: crawl everything)",
+    )
     args = parser.parse_args()
     n_workers = max(1, min(32, args.workers))
     delay = max(0.0, args.delay)
 
+    seeds = [resolve_seed(p) for p in args.paths] if args.paths else [(BASE_URL, OUTPUT_ROOT)]
+
     log.info(
-        "Starting Myrient crawler. workers=%d delay=%.1fs output=%s",
-        n_workers, delay, OUTPUT_ROOT.resolve(),
+        "Starting Myrient crawler. workers=%d delay=%.1fs seeds=%d",
+        n_workers, delay, len(seeds),
     )
 
     work_queue: queue.Queue = queue.Queue()
-    work_queue.put((BASE_URL, OUTPUT_ROOT))
+    for seed in seeds:
+        work_queue.put(seed)
 
     threads = [
         threading.Thread(target=worker, args=(work_queue, delay), name=f"worker-{i+1}", daemon=True)
