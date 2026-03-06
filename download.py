@@ -28,13 +28,11 @@ import requests
 from rich.console import Console
 from rich.progress import (
     BarColumn,
-    DownloadColumn,
     Progress,
     SpinnerColumn,
     TaskID,
     TextColumn,
     TimeRemainingColumn,
-    TransferSpeedColumn,
 )
 from rich.prompt import Confirm
 
@@ -236,17 +234,10 @@ def main() -> None:
         SpinnerColumn(),
         TextColumn("[bold]{task.fields[filename]}", justify="left"),
         BarColumn(),
-        DownloadColumn(),
-        TransferSpeedColumn(),
+        TextColumn("{task.percentage:>3.0f}%"),
         TimeRemainingColumn(),
         console=console,
     ) as progress:
-        overall_task = progress.add_task(
-            "overall",
-            filename=f"[cyan]Overall[/]  {already_done}/{len(all_downloads)} files",
-            total=len(all_downloads),
-            completed=already_done,
-        )
 
         def worker() -> None:
             nonlocal completed, failed
@@ -291,6 +282,13 @@ def main() -> None:
         ]
         for t in threads:
             t.start()
+        # Add overall last so it renders below the active file bars
+        overall_task = progress.add_task(
+            "overall",
+            filename=f"[cyan]Overall[/]  {already_done}/{len(all_downloads)} files",
+            total=len(all_downloads),
+            completed=already_done,
+        )
         work_q.join()
         for _ in threads:
             work_q.put(None)
