@@ -68,11 +68,14 @@ def resolve_root(path_or_url: str) -> Path:
     return Path(path_or_url)
 
 
-def collect_stats(root: Path) -> tuple[int, int, int]:
-    """Return (file_count, dir_count, total_bytes) by walking metadata.tsv files."""
-    files = dirs = total_bytes = 0
+def collect_stats(root: Path) -> tuple[int, int, int, int]:
+    """Return (file_count, dir_count, total_bytes, max_depth) by walking metadata.tsv files."""
+    files = dirs = total_bytes = max_depth = 0
 
     for tsv_path in root.rglob("metadata.tsv"):
+        depth = len(tsv_path.relative_to(root).parts) - 1
+        if depth > max_depth:
+            max_depth = depth
         with open(tsv_path, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh, delimiter="\t"):
                 if row.get("File Size", "-") == "-":
@@ -81,7 +84,63 @@ def collect_stats(root: Path) -> tuple[int, int, int]:
                     files += 1
                     total_bytes += parse_size(row.get("File Size", ""))
 
-    return files, dirs, total_bytes
+    return files, dirs, total_bytes, max_depth
+
+
+def build_tree(directory: Path, name: str) -> dict:
+    """Recursively build a stats tree for a directory node."""
+    local_files = local_dirs = local_bytes = 0
+    children = []
+
+    tsv_path = directory / "metadata.tsv"
+    if tsv_path.exists():
+        with open(tsv_path, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                if row.get("File Size", "-") == "-":
+                    local_dirs += 1
+                    child_name = row.get("File Name", "").rstrip("/")
+                    child_path = directory / child_name
+                    if child_path.is_dir():
+                        children.append(build_tree(child_path, child_name))
+                else:
+                    local_files += 1
+                    local_bytes += parse_size(row.get("File Size", ""))
+
+    return {
+        "name": name,
+        "total_files": local_files + sum(c["total_files"] for c in children),
+        "total_dirs": local_dirs + sum(c["total_dirs"] for c in children),
+        "total_bytes": local_bytes + sum(c["total_bytes"] for c in children),
+        "children": children,
+    }
+
+
+def _collect_col_widths(node: dict) -> tuple[int, int, int]:
+    """Return (max_files_w, max_dirs_w, max_size_w) across the whole tree."""
+    fw = len(f"{node['total_files']:,}")
+    dw = len(f"{node['total_dirs']:,}")
+    sw = len(fmt_size(node['total_bytes']))
+    for child in node["children"]:
+        cf, cd, cs = _collect_col_widths(child)
+        fw, dw, sw = max(fw, cf), max(dw, cd), max(sw, cs)
+    return fw, dw, sw
+
+
+def _row(node: dict, col_widths: tuple[int, int, int], tree_part: str) -> str:
+    fw, dw, sw = col_widths
+    files_col = f"{node['total_files']:>{fw},} files"
+    dirs_col  = f"{node['total_dirs']:>{dw},} dirs"
+    size_col  = f"{fmt_size(node['total_bytes']):>{sw}}"
+    return f"{files_col} │ {dirs_col} │ {size_col}  {tree_part}"
+
+
+def print_tree(node: dict, col_widths: tuple[int, int, int], prefix: str = "", is_last: bool = True) -> None:
+    connector = "└── " if is_last else "├── "
+    print(_row(node, col_widths, f"{prefix}{connector}{node['name']}"))
+    child_prefix = prefix + ("    " if is_last else "│   ")
+    children = node["children"]
+    for i, child in enumerate(children):
+        print_tree(child, col_widths, child_prefix, i == len(children) - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +156,11 @@ def main() -> None:
         metavar="PATH_OR_URL",
         help="local files/ path or Myrient URL to inspect (default: files/)",
     )
+    parser.add_argument(
+        "--expanded",
+        action="store_true",
+        help="print full directory tree with per-node file count, dir count, and size",
+    )
     args = parser.parse_args()
 
     root = resolve_root(args.path)
@@ -104,12 +168,22 @@ def main() -> None:
         print(f"Error: path does not exist: {root}", file=sys.stderr)
         sys.exit(1)
 
-    file_count, dir_count, total_bytes = collect_stats(root)
+    file_count, dir_count, total_bytes, max_depth = collect_stats(root)
 
     print(f"Root        : {root.resolve()}")
     print(f"Files       : {file_count:,}")
     print(f"Directories : {dir_count:,}")
+    print(f"Max depth   : {max_depth}")
     print(f"Total size  : {fmt_size(total_bytes)}  ({total_bytes:,} bytes)")
+
+    if args.expanded:
+        print()
+        tree = build_tree(root, root.resolve().name)
+        col_widths = _collect_col_widths(tree)
+        print(_row(tree, col_widths, tree["name"]))
+        children = tree["children"]
+        for i, child in enumerate(children):
+            print_tree(child, col_widths, "", i == len(children) - 1)
 
 
 if __name__ == "__main__":
