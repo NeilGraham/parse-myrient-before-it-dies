@@ -169,6 +169,27 @@ def _row(node: dict, col_widths: tuple[int, int, int], tree_part: str) -> str:
     return f"{pct_col} │ {files_col} │ {dirs_col} │ {size_col}  {tree_part}"
 
 
+def sort_tree(node: dict, sort_by: list[str]) -> None:
+    """Recursively sort children of node in-place by one or more keys."""
+    def key(c: dict) -> tuple:
+        parts = []
+        for k in sort_by:
+            if k == "name":
+                parts.append(c["name"])
+            elif k == "files":
+                parts.append(-c["total_files"])
+            elif k == "dirs":
+                parts.append(-c["total_dirs"])
+            elif k == "size":
+                parts.append(-c["total_bytes"])
+            elif k == "done":
+                parts.append(-(c["downloaded_files"] / c["total_files"]) if c["total_files"] else 1.0)
+        return tuple(parts)
+    node["children"].sort(key=key)
+    for child in node["children"]:
+        sort_tree(child, sort_by)
+
+
 def print_tree(node: dict, col_widths: tuple[int, int, int], prefix: str = "", is_last: bool = True) -> None:
     connector = "└── " if is_last else "├── "
     print(_row(node, col_widths, f"{prefix}{connector}{node['name']}"))
@@ -209,6 +230,15 @@ def main() -> None:
         "--expanded",
         action="store_true",
         help="print full directory tree with per-node file count, dir count, and size",
+    )
+    parser.add_argument(
+        "--sort-by",
+        nargs="+",
+        choices=["done", "files", "dirs", "size", "name"],
+        default=None,
+        metavar="TYPE",
+        help="sort children in --expanded tree by one or more keys: done, files, dirs, size, name"
+             " (descending except name); e.g. --sort-by done size name",
     )
     parser.add_argument(
         "--finclude", nargs="+", metavar="PATTERN", default=[],
@@ -293,6 +323,10 @@ def main() -> None:
             build_tree(root, root.resolve().name, args.finclude, args.fexclude)
             for _raw, root, _url in entries
         ]
+
+        if args.sort_by:
+            for tree in trees:
+                sort_tree(tree, args.sort_by)
 
         # Unified column widths across all trees
         col_widths = (0, 0, 0)
