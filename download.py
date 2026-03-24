@@ -18,6 +18,7 @@ Stall-safe: timed-out or dropped connections are re-queued up to MAX_ATTEMPTS ti
 
 import argparse
 import csv
+import glob as glob_mod
 import queue
 import subprocess
 import sys
@@ -39,7 +40,7 @@ from rich.prompt import Confirm
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
-from stats import collect_stats, fmt_size, resolve_root  # noqa: E402
+from stats import collect_stats, file_matches, fmt_size, parse_size, resolve_root  # noqa: E402
 
 BASE_URL = "https://myrient.erista.me/files/"
 OUTPUT_ROOT = Path("files")
@@ -80,15 +81,16 @@ def run_crawl(root: Path) -> None:
 # Download list
 # ---------------------------------------------------------------------------
 
-def collect_downloads(root: Path) -> list[tuple[str, Path]]:
-    """Return (url, local_path) pairs for every file entry under root."""
-    items: list[tuple[str, Path]] = []
+def collect_downloads(root: Path, finclude: list[str] = [], fexclude: list[str] = []) -> list[tuple[str, Path, int]]:
+    """Return (url, local_path, size_bytes) triples for every file entry under root."""
+    items: list[tuple[str, Path, int]] = []
     for tsv_path in sorted(root.rglob("metadata.tsv")):
         dir_path = tsv_path.parent
         with open(tsv_path, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh, delimiter="\t"):
                 if row.get("File Size", "-") != "-":
-                    items.append((row["URL"], dir_path / row["File Name"]))
+                    if file_matches(row["File Name"], finclude, fexclude):
+                        items.append((row["URL"], dir_path / row["File Name"], parse_size(row["File Size"])))
     return items
 
 
@@ -152,68 +154,126 @@ def download_file(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _derive_myrient_url(raw: str, root: Path) -> str:
+    if raw.startswith("http"):
+        return raw if raw.endswith("/") else raw + "/"
+    try:
+        rel = root.resolve().relative_to(OUTPUT_ROOT.resolve())
+        return BASE_URL + "/".join(quote(p, safe="") for p in rel.parts) + "/"
+    except ValueError:
+        return BASE_URL
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Myrient file downloader")
     parser.add_argument(
-        "path",
+        "paths",
+        nargs="+",
         metavar="PATH_OR_URL",
-        help="local files/ path or Myrient URL to download",
+        help="local files/ paths (glob patterns supported) or Myrient URLs to download",
     )
     parser.add_argument(
         "--workers", type=int, default=DEFAULT_WORKERS, metavar="N",
         help=f"number of concurrent download threads (default {DEFAULT_WORKERS})",
     )
+    parser.add_argument(
+        "--finclude", nargs="+", metavar="PATTERN", default=[],
+        help="only download files whose name matches any of these regexes",
+    )
+    parser.add_argument(
+        "--fexclude", nargs="+", metavar="PATTERN", default=[],
+        help="exclude files whose name matches any of these regexes (applied after --finclude)",
+    )
     args = parser.parse_args()
     n_workers = max(1, min(32, args.workers))
 
-    root = resolve_root(args.path)
+    # Expand glob patterns for local paths; URLs pass through unchanged
+    raw_inputs: list[str] = []
+    for p in args.paths:
+        if p.startswith("http"):
+            raw_inputs.append(p)
+        else:
+            matches = sorted(glob_mod.glob(p))
+            raw_inputs.extend(matches if matches else [p])
 
-    # Derive the Myrient URL from whichever form was provided
-    if args.path.startswith("http"):
-        myrient_url = args.path if args.path.endswith("/") else args.path + "/"
-    else:
-        try:
-            rel = root.resolve().relative_to(OUTPUT_ROOT.resolve())
-            myrient_url = BASE_URL + "/".join(quote(p, safe="") for p in rel.parts) + "/"
-        except ValueError:
-            myrient_url = BASE_URL
+    # Build (raw, root, myrient_url) triples
+    targets = [
+        (raw, resolve_root(raw), _derive_myrient_url(raw, resolve_root(raw)))
+        for raw in raw_inputs
+    ]
 
-    # --- Step 1: Ensure metadata is up to date ---
-    run_crawl(root)
+    # --- Step 1: Ensure metadata is up to date for all targets ---
+    for _raw, root, _url in targets:
+        run_crawl(root)
 
-    if not root.exists():
-        console.print(f"[red]Error: path does not exist after crawl: {root}[/]")
-        sys.exit(1)
+    # Validate existence after crawl
+    for _raw, root, _url in targets:
+        if not root.exists():
+            console.print(f"[red]Error: path does not exist after crawl: {root}[/]")
+            sys.exit(1)
 
-    # --- Step 2: Stats overview and confirmation ---
-    file_count, dir_count, total_bytes, max_depth = collect_stats(root)
+    # --- Step 2: Collect downloads and compute pending/done per target ---
+    filtering = bool(args.finclude or args.fexclude)
+    target_stats = []
+    for _raw, root, myrient_url in targets:
+        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude)
+        if filtering:
+            total_file_count, _, total_bytes_all, _ = collect_stats(root)
+        else:
+            total_file_count, total_bytes_all = file_count, total_bytes
+        downloads = collect_downloads(root, args.finclude, args.fexclude)
+        pending_items   = [(url, path, sz) for url, path, sz in downloads if not path.exists()]
+        done_count      = len(downloads) - len(pending_items)
+        pending_bytes   = sum(sz for _, _, sz in pending_items)
+        target_stats.append((root, myrient_url, file_count, total_file_count, dir_count,
+                             total_bytes, total_bytes_all, max_depth,
+                             downloads, pending_items, done_count, pending_bytes))
 
     console.print()
     console.rule("[bold]Download Overview")
-    console.print(f"  [dim]Local path  :[/] {root.resolve()}")
-    console.print(f"  [dim]Myrient URL :[/] {myrient_url}")
-    console.print(f"  [dim]Files       :[/] {file_count:,}")
-    console.print(f"  [dim]Directories :[/] {dir_count:,}")
-    console.print(f"  [dim]Max depth   :[/] {max_depth}")
-    console.print(f"  [dim]Total size  :[/] {fmt_size(total_bytes)}  ({total_bytes:,} bytes)")
+
+    grand_files = grand_pending = grand_pending_bytes = 0
+    for i, (root, myrient_url, file_count, total_file_count, dir_count,
+            total_bytes, total_bytes_all, max_depth,
+            _dl, pending_items, done_count, pending_bytes) in enumerate(target_stats, 1):
+        if len(target_stats) > 1:
+            console.print(f"\n  [bold cyan][{i} / {len(target_stats)}][/]")
+        console.print(f"  [dim]Local path  :[/] {root.resolve()}")
+        console.print(f"  [dim]Myrient URL :[/] {myrient_url}")
+        console.print(f"  [dim]Directories :[/] {dir_count:,}")
+        console.print(f"  [dim]Max depth   :[/] {max_depth}")
+        if filtering:
+            console.print(f"  [dim]Total files :[/] {total_file_count:,}")
+            console.print(f"  [dim]Total size  :[/] {fmt_size(total_bytes)} selected ({total_bytes:,} bytes)  /  {fmt_size(total_bytes_all)} total ({total_bytes_all:,} bytes)")
+        console.print(f"  [dim]Already done:[/] [green]{done_count:,}[/] / {file_count:,} {'selected ' if filtering else ''}files")
+        console.print(f"  [dim]To download :[/] [cyan]{len(pending_items):,}[/] files  ({fmt_size(pending_bytes)})")
+        grand_files        += file_count
+        grand_pending      += len(pending_items)
+        grand_pending_bytes += pending_bytes
+
     console.print()
+    if len(target_stats) > 1:
+        console.print(f"  [bold]Grand total :[/] {grand_pending:,} files to download  ({fmt_size(grand_pending_bytes)})")
+        console.print()
+
+    if grand_pending == 0:
+        console.print(f"[bold green]  All {grand_files:,} files already downloaded — nothing to do![/]")
+        sys.exit(0)
 
     if not Confirm.ask(
-        f"  Download all [bold cyan]{file_count:,}[/] files ([bold]{fmt_size(total_bytes)}[/])?"
+        f"  Download [bold cyan]{grand_pending:,}[/] files ([bold]{fmt_size(grand_pending_bytes)}[/])?"
     ):
         console.print("  Aborted.")
         sys.exit(0)
 
-    # --- Step 3: Determine what still needs downloading ---
-    all_downloads = collect_downloads(root)
-    pending = [(url, path) for url, path in all_downloads if not path.exists()]
+    # --- Step 3: Flatten pending list across all targets ---
+    all_downloads: list[tuple[str, Path, int]] = []
+    for _, _, _, _, _, _, _, _, downloads, _, _, _ in target_stats:
+        all_downloads.extend(downloads)
+
+    pending = [(url, path, sz) for url, path, sz in all_downloads if not path.exists()]
     already_done = len(all_downloads) - len(pending)
 
-    console.print()
-    console.print(
-        f"  [green]{already_done:,}[/] files already downloaded, "
-        f"[cyan]{len(pending):,}[/] remaining."
-    )
     console.print()
 
     if not pending:
@@ -227,7 +287,7 @@ def main() -> None:
 
     # Queue items: (url, local_path, attempt_number)
     work_q: queue.Queue = queue.Queue()
-    for url, path in pending:
+    for url, path, _sz in pending:
         work_q.put((url, path, 1))
 
     with Progress(

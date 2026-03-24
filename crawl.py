@@ -180,10 +180,10 @@ def read_tsv(path: Path) -> list[dict]:
         return list(csv.DictReader(fh, delimiter="\t"))
 
 
-def crawl_one(url: str, out_dir: Path, work_queue: queue.Queue, delay: float) -> None:
+def crawl_one(url: str, out_dir: Path, work_queue: queue.Queue, delay: float, force: bool = False) -> None:
     tsv_path = out_dir / "metadata.tsv"
 
-    if tsv_path.exists():
+    if tsv_path.exists() and not force:
         log.info("SKIP (already done)  %s", url)
         enqueue_subdirs(read_tsv(tsv_path), out_dir, work_queue)
         return
@@ -203,14 +203,14 @@ def crawl_one(url: str, out_dir: Path, work_queue: queue.Queue, delay: float) ->
     enqueue_subdirs(rows, out_dir, work_queue)
 
 
-def worker(work_queue: queue.Queue, delay: float) -> None:
+def worker(work_queue: queue.Queue, delay: float, force: bool = False) -> None:
     while True:
         item = work_queue.get()
         if item is None:
             work_queue.task_done()
             break
         try:
-            crawl_one(*item, work_queue=work_queue, delay=delay)
+            crawl_one(*item, work_queue=work_queue, delay=delay, force=force)
         finally:
             work_queue.task_done()
 
@@ -250,6 +250,11 @@ def main() -> None:
         "--paths", nargs="+", metavar="PATH_OR_URL",
         help="one or more Myrient URLs or local files/ paths to crawl (default: crawl everything)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="re-crawl directories even if metadata.tsv already exists",
+    )
     args = parser.parse_args()
     n_workers = max(1, min(32, args.workers))
     delay = max(0.0, args.delay)
@@ -257,8 +262,8 @@ def main() -> None:
     seeds = [resolve_seed(p) for p in args.paths] if args.paths else [(BASE_URL, OUTPUT_ROOT)]
 
     log.info(
-        "Starting Myrient crawler. workers=%d delay=%.1fs seeds=%d",
-        n_workers, delay, len(seeds),
+        "Starting Myrient crawler. workers=%d delay=%.1fs seeds=%d force=%s",
+        n_workers, delay, len(seeds), args.force,
     )
 
     work_queue: queue.Queue = queue.Queue()
@@ -266,7 +271,7 @@ def main() -> None:
         work_queue.put(seed)
 
     threads = [
-        threading.Thread(target=worker, args=(work_queue, delay), name=f"worker-{i+1}", daemon=True)
+        threading.Thread(target=worker, args=(work_queue, delay, args.force), name=f"worker-{i+1}", daemon=True)
         for i in range(n_workers)
     ]
     for t in threads:

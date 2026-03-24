@@ -13,6 +13,7 @@ Accepts a local files/ path or a Myrient URL as the root to inspect.
 
 import argparse
 import csv
+import math
 import re
 import subprocess
 import sys
@@ -59,6 +60,19 @@ def fmt_size(n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# File filtering
+# ---------------------------------------------------------------------------
+
+def file_matches(filename: str, finclude: list[str], fexclude: list[str]) -> bool:
+    """Return True if filename passes the include/exclude regex filters."""
+    if finclude and not any(re.search(p, filename) for p in finclude):
+        return False
+    if any(re.search(p, filename) for p in fexclude):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # TSV walking
 # ---------------------------------------------------------------------------
 
@@ -70,7 +84,7 @@ def resolve_root(path_or_url: str) -> Path:
     return Path(path_or_url)
 
 
-def collect_stats(root: Path) -> tuple[int, int, int, int]:
+def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = []) -> tuple[int, int, int, int]:
     """Return (file_count, dir_count, total_bytes, max_depth) by walking metadata.tsv files."""
     files = dirs = total_bytes = max_depth = 0
 
@@ -83,15 +97,17 @@ def collect_stats(root: Path) -> tuple[int, int, int, int]:
                 if row.get("File Size", "-") == "-":
                     dirs += 1
                 else:
+                    if not file_matches(row["File Name"], finclude, fexclude):
+                        continue
                     files += 1
                     total_bytes += parse_size(row.get("File Size", ""))
 
     return files, dirs, total_bytes, max_depth
 
 
-def build_tree(directory: Path, name: str) -> dict:
+def build_tree(directory: Path, name: str, finclude: list[str] = [], fexclude: list[str] = []) -> dict:
     """Recursively build a stats tree for a directory node."""
-    local_files = local_dirs = local_bytes = 0
+    local_files = local_dirs = local_bytes = local_downloaded = 0
     children = []
 
     tsv_path = directory / "metadata.tsv"
@@ -103,18 +119,33 @@ def build_tree(directory: Path, name: str) -> dict:
                     child_name = row.get("File Name", "").rstrip("/")
                     child_path = directory / child_name
                     if child_path.is_dir():
-                        children.append(build_tree(child_path, child_name))
+                        children.append(build_tree(child_path, child_name, finclude, fexclude))
                 else:
+                    if not file_matches(row["File Name"], finclude, fexclude):
+                        continue
                     local_files += 1
                     local_bytes += parse_size(row.get("File Size", ""))
+                    if (directory / row["File Name"]).exists():
+                        local_downloaded += 1
 
+    total_files = local_files + sum(c["total_files"] for c in children)
+    total_downloaded = local_downloaded + sum(c["downloaded_files"] for c in children)
     return {
         "name": name,
-        "total_files": local_files + sum(c["total_files"] for c in children),
+        "total_files": total_files,
         "total_dirs": local_dirs + sum(c["total_dirs"] for c in children),
         "total_bytes": local_bytes + sum(c["total_bytes"] for c in children),
+        "downloaded_files": total_downloaded,
         "children": children,
     }
+
+
+def fmt_pct(downloaded: int, total: int) -> str:
+    if total == 0:
+        return "  -%"
+    if downloaded == total:
+        return "100%"
+    return f"{math.floor(downloaded / total * 100):>3}%"
 
 
 def _collect_col_widths(node: dict) -> tuple[int, int, int]:
@@ -130,10 +161,11 @@ def _collect_col_widths(node: dict) -> tuple[int, int, int]:
 
 def _row(node: dict, col_widths: tuple[int, int, int], tree_part: str) -> str:
     fw, dw, sw = col_widths
+    pct_col   = fmt_pct(node['downloaded_files'], node['total_files'])
     files_col = f"{node['total_files']:>{fw},} files"
     dirs_col  = f"{node['total_dirs']:>{dw},} dirs"
     size_col  = f"{fmt_size(node['total_bytes']):>{sw}}"
-    return f"{files_col} │ {dirs_col} │ {size_col}  {tree_part}"
+    return f"{pct_col} │ {files_col} │ {dirs_col} │ {size_col}  {tree_part}"
 
 
 def print_tree(node: dict, col_widths: tuple[int, int, int], prefix: str = "", is_last: bool = True) -> None:
@@ -177,6 +209,14 @@ def main() -> None:
         action="store_true",
         help="print full directory tree with per-node file count, dir count, and size",
     )
+    parser.add_argument(
+        "--finclude", nargs="+", metavar="PATTERN", default=[],
+        help="only count files whose name matches any of these regexes",
+    )
+    parser.add_argument(
+        "--fexclude", nargs="+", metavar="PATTERN", default=[],
+        help="exclude files whose name matches any of these regexes (applied after --finclude)",
+    )
     args = parser.parse_args()
 
     if args.crawl:
@@ -198,18 +238,27 @@ def main() -> None:
         except ValueError:
             myrient_url = BASE_URL
 
-    file_count, dir_count, total_bytes, max_depth = collect_stats(root)
+    file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude)
+    filtering = bool(args.finclude or args.fexclude)
+    if filtering:
+        total_file_count, _, total_bytes_all, _ = collect_stats(root)
 
     print(f"Local path  : {root.resolve()}")
     print(f"Myrient URL : {myrient_url}")
-    print(f"Files       : {file_count:,}")
+    if filtering:
+        print(f"Files       : {file_count:,} selected  /  {total_file_count:,} total")
+    else:
+        print(f"Files       : {file_count:,}")
     print(f"Directories : {dir_count:,}")
     print(f"Max depth   : {max_depth}")
-    print(f"Total size  : {fmt_size(total_bytes)}  ({total_bytes:,} bytes)")
+    if filtering:
+        print(f"Total size  : {fmt_size(total_bytes)} selected ({total_bytes:,} bytes)  /  {fmt_size(total_bytes_all)} total ({total_bytes_all:,} bytes)")
+    else:
+        print(f"Total size  : {fmt_size(total_bytes)}  ({total_bytes:,} bytes)")
 
     if args.expanded:
         print()
-        tree = build_tree(root, root.resolve().name)
+        tree = build_tree(root, root.resolve().name, args.finclude, args.fexclude)
         col_widths = _collect_col_widths(tree)
         print(_row(tree, col_widths, tree["name"]))
         children = tree["children"]
