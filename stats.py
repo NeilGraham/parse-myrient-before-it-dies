@@ -13,6 +13,7 @@ Accepts a local files/ path or a Myrient URL as the root to inspect.
 
 import argparse
 import csv
+import glob as glob_mod
 import math
 import re
 import subprocess
@@ -193,11 +194,11 @@ def run_crawl(path_or_url: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Myrient directory statistics")
     parser.add_argument(
-        "path",
-        nargs="?",
-        default=str(OUTPUT_ROOT),
+        "paths",
+        nargs="*",
+        default=[str(OUTPUT_ROOT)],
         metavar="PATH_OR_URL",
-        help="local files/ path or Myrient URL to inspect (default: files/)",
+        help="local files/ paths or Myrient URLs to inspect (default: files/)",
     )
     parser.add_argument(
         "--crawl",
@@ -219,51 +220,100 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.crawl:
-        run_crawl(args.path)
-
-    root = resolve_root(args.path)
-    if not root.exists():
-        print(f"Error: path does not exist: {root}", file=sys.stderr)
-        sys.exit(1)
-
-    # Derive the Myrient URL from whichever form was provided
-    raw = args.path
-    if raw.startswith("http"):
-        myrient_url = raw if raw.endswith("/") else raw + "/"
-    else:
-        try:
-            rel = root.resolve().relative_to(OUTPUT_ROOT.resolve())
-            myrient_url = BASE_URL + "/".join(quote(p, safe="") for p in rel.parts) + "/"
-        except ValueError:
-            myrient_url = BASE_URL
-
-    file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude)
     filtering = bool(args.finclude or args.fexclude)
-    if filtering:
-        total_file_count, _, total_bytes_all, _ = collect_stats(root)
 
-    print(f"Local path  : {root.resolve()}")
-    print(f"Myrient URL : {myrient_url}")
-    if filtering:
-        print(f"Files       : {file_count:,} selected  /  {total_file_count:,} total")
-    else:
-        print(f"Files       : {file_count:,}")
-    print(f"Directories : {dir_count:,}")
-    print(f"Max depth   : {max_depth}")
-    if filtering:
-        print(f"Total size  : {fmt_size(total_bytes)} selected ({total_bytes:,} bytes)  /  {fmt_size(total_bytes_all)} total ({total_bytes_all:,} bytes)")
-    else:
-        print(f"Total size  : {fmt_size(total_bytes)}  ({total_bytes:,} bytes)")
+    # Expand glob patterns for local paths; URLs pass through unchanged
+    raw_paths: list[str] = []
+    for p in args.paths:
+        if p.startswith("http"):
+            raw_paths.append(p)
+        else:
+            matches = sorted(glob_mod.glob(p))
+            raw_paths.extend(matches if matches else [p])
+
+    if args.crawl:
+        for raw in raw_paths:
+            run_crawl(raw)
+
+    # Resolve roots and derive Myrient URLs
+    entries: list[tuple[str, Path, str]] = []
+    for raw in raw_paths:
+        root = resolve_root(raw)
+        if not root.exists():
+            print(f"Error: path does not exist: {root}", file=sys.stderr)
+            sys.exit(1)
+        if raw.startswith("http"):
+            myrient_url = raw if raw.endswith("/") else raw + "/"
+        else:
+            try:
+                rel = root.resolve().relative_to(OUTPUT_ROOT.resolve())
+                myrient_url = BASE_URL + "/".join(quote(p, safe="") for p in rel.parts) + "/"
+            except ValueError:
+                myrient_url = BASE_URL
+        entries.append((raw, root, myrient_url))
+
+    # Per-path summary
+    grand_files = grand_files_total = grand_bytes = grand_bytes_total = 0
+    for i, (_raw, root, myrient_url) in enumerate(entries):
+        if len(entries) > 1:
+            print(f"\n[{i + 1} / {len(entries)}]")
+        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude)
+        if filtering:
+            total_file_count, _, total_bytes_all, _ = collect_stats(root)
+        else:
+            total_file_count, total_bytes_all = file_count, total_bytes
+        print(f"Local path  : {root.resolve()}")
+        print(f"Myrient URL : {myrient_url}")
+        if file_count != total_file_count:
+            print(f"Files       : {file_count:,} selected  /  {total_file_count:,} total")
+        else:
+            print(f"Files       : {file_count:,}")
+        print(f"Directories : {dir_count:,}")
+        print(f"Max depth   : {max_depth}")
+        if total_bytes != total_bytes_all:
+            print(f"Total size  : {fmt_size(total_bytes)} selected ({total_bytes:,} bytes)  /  {fmt_size(total_bytes_all)} total ({total_bytes_all:,} bytes)")
+        else:
+            print(f"Total size  : {fmt_size(total_bytes)}  ({total_bytes:,} bytes)")
+        grand_files       += file_count
+        grand_files_total += total_file_count
+        grand_bytes       += total_bytes
+        grand_bytes_total += total_bytes_all
+
+    if len(entries) > 1:
+        print()
+        if grand_files != grand_files_total:
+            print(f"Grand total : {grand_files:,} selected  /  {grand_files_total:,} total files")
+            print(f"Grand size  : {fmt_size(grand_bytes)} selected ({grand_bytes:,} bytes)  /  {fmt_size(grand_bytes_total)} total ({grand_bytes_total:,} bytes)")
+        else:
+            print(f"Grand total : {grand_files:,} files")
+            print(f"Grand size  : {fmt_size(grand_bytes)} ({grand_bytes:,} bytes)")
 
     if args.expanded:
+        trees = [
+            build_tree(root, root.resolve().name, args.finclude, args.fexclude)
+            for _raw, root, _url in entries
+        ]
+
+        # Unified column widths across all trees
+        col_widths = (0, 0, 0)
+        for tree in trees:
+            cw = _collect_col_widths(tree)
+            col_widths = tuple(max(a, b) for a, b in zip(col_widths, cw))
+
         print()
-        tree = build_tree(root, root.resolve().name, args.finclude, args.fexclude)
-        col_widths = _collect_col_widths(tree)
-        print(_row(tree, col_widths, tree["name"]))
-        children = tree["children"]
-        for i, child in enumerate(children):
-            print_tree(child, col_widths, "", i == len(children) - 1)
+        if len(trees) == 1:
+            tree = trees[0]
+            print(_row(tree, col_widths, tree["name"]))
+            for i, child in enumerate(tree["children"]):
+                print_tree(child, col_widths, "", i == len(tree["children"]) - 1)
+        else:
+            for i, tree in enumerate(trees):
+                is_last = i == len(trees) - 1
+                connector = "└── " if is_last else "├── "
+                print(_row(tree, col_widths, f"{connector}{tree['name']}"))
+                child_prefix = "    " if is_last else "│   "
+                for j, child in enumerate(tree["children"]):
+                    print_tree(child, col_widths, child_prefix, j == len(tree["children"]) - 1)
 
 
 if __name__ == "__main__":

@@ -232,7 +232,7 @@ def main() -> None:
     console.print()
     console.rule("[bold]Download Overview")
 
-    grand_files = grand_pending = grand_pending_bytes = 0
+    grand_files = grand_total_files = grand_pending = grand_pending_bytes = grand_total_bytes = 0
     for i, (root, myrient_url, file_count, total_file_count, dir_count,
             total_bytes, total_bytes_all, max_depth,
             _dl, pending_items, done_count, pending_bytes) in enumerate(target_stats, 1):
@@ -242,22 +242,31 @@ def main() -> None:
         console.print(f"  [dim]Myrient URL :[/] {myrient_url}")
         console.print(f"  [dim]Directories :[/] {dir_count:,}")
         console.print(f"  [dim]Max depth   :[/] {max_depth}")
-        if filtering:
+        if file_count != total_file_count:
             console.print(f"  [dim]Total files :[/] {total_file_count:,}")
+        if total_bytes != total_bytes_all:
             console.print(f"  [dim]Total size  :[/] {fmt_size(total_bytes)} selected ({total_bytes:,} bytes)  /  {fmt_size(total_bytes_all)} total ({total_bytes_all:,} bytes)")
-        console.print(f"  [dim]Already done:[/] [green]{done_count:,}[/] / {file_count:,} {'selected ' if filtering else ''}files")
+        if done_count:
+            console.print(f"  [dim]Already done:[/] [green]{done_count:,}[/] / {file_count:,} {'selected ' if file_count != total_file_count else ''}files")
         console.print(f"  [dim]To download :[/] [cyan]{len(pending_items):,}[/] files  ({fmt_size(pending_bytes)})")
         grand_files        += file_count
+        grand_total_files  += total_file_count
         grand_pending      += len(pending_items)
         grand_pending_bytes += pending_bytes
+        grand_total_bytes  += total_bytes_all
 
     console.print()
     if len(target_stats) > 1:
-        console.print(f"  [bold]Grand total :[/] {grand_pending:,} files to download  ({fmt_size(grand_pending_bytes)})")
+        if grand_pending != grand_total_files:
+            console.print(f"  [bold]Grand total :[/] {grand_pending:,} to download  /  {grand_total_files:,} total files")
+            console.print(f"  [bold]Grand size  :[/] {fmt_size(grand_pending_bytes)} to download ({grand_pending_bytes:,} bytes)  /  {fmt_size(grand_total_bytes)} total ({grand_total_bytes:,} bytes)")
+        else:
+            console.print(f"  [bold]Grand total :[/] {grand_total_files:,} files to download")
+            console.print(f"  [bold]Grand size  :[/] {fmt_size(grand_total_bytes)} ({grand_total_bytes:,} bytes)")
         console.print()
 
     if grand_pending == 0:
-        console.print(f"[bold green]  All {grand_files:,} files already downloaded — nothing to do![/]")
+        console.print(f"[bold green]  All {grand_total_files:,} files already downloaded — nothing to do![/]")
         sys.exit(0)
 
     if not Confirm.ask(
