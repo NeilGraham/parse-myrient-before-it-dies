@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "parse-myrient"
+version = "0.1.0"
+description = "Crawl, inspect, and download files from myrient.erista.me"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4",
+    "requests",
+    "rich",
+]
+
+[project.scripts]
+myrient-crawl = "crawl:main"
+myrient-stats = "stats:main"
+myrient-download = "download:main"
+
+[tool.hatch.build.targets.wheel]
+include = ["crawl.py", "stats.py", "download.py"]
+
+[dependency-groups]
+dev = []

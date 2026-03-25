@@ -73,6 +73,15 @@ def file_matches(filename: str, finclude: list[str], fexclude: list[str]) -> boo
     return True
 
 
+def dir_matches(rel_dir: str, dinclude: list[str], dexclude: list[str]) -> bool:
+    """Return True if a relative directory path passes the include/exclude regex filters."""
+    if dinclude and not any(re.search(p, rel_dir) for p in dinclude):
+        return False
+    if any(re.search(p, rel_dir) for p in dexclude):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # TSV walking
 # ---------------------------------------------------------------------------
@@ -85,7 +94,7 @@ def resolve_root(path_or_url: str) -> Path:
     return Path(path_or_url)
 
 
-def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = []) -> tuple[int, int, int, int]:
+def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = []) -> tuple[int, int, int, int]:
     """Return (file_count, dir_count, total_bytes, max_depth) by walking metadata.tsv files."""
     files = dirs = total_bytes = max_depth = 0
 
@@ -93,6 +102,9 @@ def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = []
         depth = len(tsv_path.relative_to(root).parts) - 1
         if depth > max_depth:
             max_depth = depth
+        rel_dir = "/".join(tsv_path.parent.relative_to(root).parts)
+        if rel_dir and not dir_matches(rel_dir, dinclude, dexclude):
+            continue
         with open(tsv_path, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh, delimiter="\t"):
                 if row.get("File Size", "-") == "-":
@@ -106,7 +118,7 @@ def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = []
     return files, dirs, total_bytes, max_depth
 
 
-def build_tree(directory: Path, name: str, finclude: list[str] = [], fexclude: list[str] = []) -> dict:
+def build_tree(directory: Path, name: str, rel_path: str, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = []) -> dict:
     """Recursively build a stats tree for a directory node."""
     local_files = local_dirs = local_bytes = local_downloaded = 0
     children = []
@@ -119,8 +131,9 @@ def build_tree(directory: Path, name: str, finclude: list[str] = [], fexclude: l
                     local_dirs += 1
                     child_name = row.get("File Name", "").rstrip("/")
                     child_path = directory / child_name
-                    if child_path.is_dir():
-                        children.append(build_tree(child_path, child_name, finclude, fexclude))
+                    child_rel = f"{rel_path}/{child_name}" if rel_path else child_name
+                    if child_path.is_dir() and dir_matches(child_rel, dinclude, dexclude):
+                        children.append(build_tree(child_path, child_name, child_rel, finclude, fexclude, dinclude, dexclude))
                 else:
                     if not file_matches(row["File Name"], finclude, fexclude):
                         continue
@@ -248,9 +261,17 @@ def main() -> None:
         "--fexclude", nargs="+", metavar="PATTERN", default=[],
         help="exclude files whose name matches any of these regexes (applied after --finclude)",
     )
+    parser.add_argument(
+        "--dinclude", nargs="+", metavar="PATTERN", default=[],
+        help="only count files in directories whose path (relative to root) matches any of these regexes",
+    )
+    parser.add_argument(
+        "--dexclude", nargs="+", metavar="PATTERN", default=[],
+        help="exclude directories whose path (relative to root) matches any of these regexes (applied after --dinclude)",
+    )
     args = parser.parse_args()
 
-    filtering = bool(args.finclude or args.fexclude)
+    filtering = bool(args.finclude or args.fexclude or args.dinclude or args.dexclude)
 
     # Expand glob patterns for local paths; URLs pass through unchanged
     raw_paths: list[str] = []
@@ -287,7 +308,7 @@ def main() -> None:
     for i, (_raw, root, myrient_url) in enumerate(entries):
         if len(entries) > 1:
             print(f"\n[{i + 1} / {len(entries)}]")
-        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude)
+        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude, args.dinclude, args.dexclude)
         if filtering:
             total_file_count, _, total_bytes_all, _ = collect_stats(root)
         else:
@@ -320,7 +341,7 @@ def main() -> None:
 
     if args.expanded:
         trees = [
-            build_tree(root, root.resolve().name, args.finclude, args.fexclude)
+            build_tree(root, root.resolve().name, "", args.finclude, args.fexclude, args.dinclude, args.dexclude)
             for _raw, root, _url in entries
         ]
 

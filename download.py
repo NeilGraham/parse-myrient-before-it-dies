@@ -40,7 +40,7 @@ from rich.prompt import Confirm
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
-from stats import collect_stats, file_matches, fmt_size, parse_size, resolve_root  # noqa: E402
+from stats import collect_stats, dir_matches, file_matches, fmt_size, parse_size, resolve_root  # noqa: E402
 
 BASE_URL = "https://myrient.erista.me/files/"
 OUTPUT_ROOT = Path("files")
@@ -81,10 +81,13 @@ def run_crawl(root: Path) -> None:
 # Download list
 # ---------------------------------------------------------------------------
 
-def collect_downloads(root: Path, finclude: list[str] = [], fexclude: list[str] = []) -> list[tuple[str, Path, int]]:
+def collect_downloads(root: Path, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = []) -> list[tuple[str, Path, int]]:
     """Return (url, local_path, size_bytes) triples for every file entry under root."""
     items: list[tuple[str, Path, int]] = []
     for tsv_path in sorted(root.rglob("metadata.tsv")):
+        rel_dir = "/".join(tsv_path.parent.relative_to(root).parts)
+        if rel_dir and not dir_matches(rel_dir, dinclude, dexclude):
+            continue
         dir_path = tsv_path.parent
         with open(tsv_path, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh, delimiter="\t"):
@@ -184,6 +187,14 @@ def main() -> None:
         "--fexclude", nargs="+", metavar="PATTERN", default=[],
         help="exclude files whose name matches any of these regexes (applied after --finclude)",
     )
+    parser.add_argument(
+        "--dinclude", nargs="+", metavar="PATTERN", default=[],
+        help="only download files in directories whose path (relative to root) matches any of these regexes",
+    )
+    parser.add_argument(
+        "--dexclude", nargs="+", metavar="PATTERN", default=[],
+        help="exclude directories whose path (relative to root) matches any of these regexes (applied after --dinclude)",
+    )
     args = parser.parse_args()
     n_workers = max(1, min(32, args.workers))
 
@@ -213,15 +224,15 @@ def main() -> None:
             sys.exit(1)
 
     # --- Step 2: Collect downloads and compute pending/done per target ---
-    filtering = bool(args.finclude or args.fexclude)
+    filtering = bool(args.finclude or args.fexclude or args.dinclude or args.dexclude)
     target_stats = []
     for _raw, root, myrient_url in targets:
-        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude)
+        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude, args.dinclude, args.dexclude)
         if filtering:
             total_file_count, _, total_bytes_all, _ = collect_stats(root)
         else:
             total_file_count, total_bytes_all = file_count, total_bytes
-        downloads = collect_downloads(root, args.finclude, args.fexclude)
+        downloads = collect_downloads(root, args.finclude, args.fexclude, args.dinclude, args.dexclude)
         pending_items   = [(url, path, sz) for url, path, sz in downloads if not path.exists()]
         done_count      = len(downloads) - len(pending_items)
         pending_bytes   = sum(sz for _, _, sz in pending_items)
