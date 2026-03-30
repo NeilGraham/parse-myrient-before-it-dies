@@ -11,6 +11,7 @@ dependencies = [
     "beautifulsoup4",
     "requests",
     "rich",
+    "textual",
 ]
 
 [project.scripts]
@@ -19,7 +20,7 @@ myrient-stats = "stats:main"
 myrient-download = "download:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["crawl.py", "stats.py", "download.py"]
+include = ["crawl.py", "stats.py", "download.py", "utils/"]
 
 [dependency-groups]
 dev = []

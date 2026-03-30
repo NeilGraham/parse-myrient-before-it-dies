@@ -5,6 +5,7 @@
 #   "beautifulsoup4",
 #   "requests",
 #   "rich",
+#   "textual",
 # ]
 # ///
 """
@@ -208,6 +209,11 @@ def main() -> None:
              "if no revision alternatives exist the base version is downloaded. "
              "Applied after --finclude/--fexclude. Does not affect Beta/Proto/Demo/Sample entries.",
     )
+    parser.add_argument(
+        "--select",
+        action="store_true",
+        help="open an interactive TUI to select which files to download (requires textual)",
+    )
     args = parser.parse_args()
     n_workers = max(1, min(32, args.workers))
 
@@ -252,6 +258,38 @@ def main() -> None:
         target_stats.append((root, myrient_url, file_count, total_file_count, dir_count,
                              total_bytes, total_bytes_all, max_depth,
                              downloads, pending_items, done_count, pending_bytes))
+
+    # --- Step 2b (optional): Interactive file selection ---
+    if args.select:
+        from utils.download_select import run_selector
+        # Merge all downloads across targets for selection
+        all_filtered: list[tuple[str, Path, int]] = []
+        merged_root = targets[0][1]  # use first target root for relative paths
+        for _, _, _, _, _, _, _, _, downloads, _, _, _ in target_stats:
+            all_filtered.extend(downloads)
+        selected = run_selector(all_filtered, merged_root)
+        if selected is None:
+            console.print("  Aborted.")
+            sys.exit(0)
+        if not selected:
+            console.print("[bold green]  No files selected — nothing to do![/]")
+            sys.exit(0)
+        # Rebuild target_stats with only the selected files
+        selected_set = {(u, str(p)) for u, p, _ in selected}
+        new_target_stats = []
+        for (root, myrient_url, _fc, total_file_count, dir_count,
+             _tb, total_bytes_all, max_depth,
+             downloads, _pi, _dc, _pb) in target_stats:
+            downloads = [(u, p, s) for u, p, s in downloads if (u, str(p)) in selected_set]
+            file_count = len(downloads)
+            total_bytes = sum(s for _, _, s in downloads)
+            pending_items = [(u, p, s) for u, p, s in downloads if not p.exists()]
+            done_count = file_count - len(pending_items)
+            pending_bytes = sum(s for _, _, s in pending_items)
+            new_target_stats.append((root, myrient_url, file_count, total_file_count, dir_count,
+                                     total_bytes, total_bytes_all, max_depth,
+                                     downloads, pending_items, done_count, pending_bytes))
+        target_stats = new_target_stats
 
     console.print()
     console.rule("[bold]Download Overview")
