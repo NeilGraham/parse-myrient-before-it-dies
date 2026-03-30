@@ -64,6 +64,40 @@ def fmt_size(n: int) -> str:
 # File filtering
 # ---------------------------------------------------------------------------
 
+_REV_RE = re.compile(r"\s*\(Rev\s+(\d+)\)", re.IGNORECASE)
+_NON_MAINLINE_RE = re.compile(r"\((Beta|Proto|Demo|Sample)\)", re.IGNORECASE)
+
+
+def latest_revisions_filter(filenames: list[str]) -> set[str]:
+    """Return the subset of filenames keeping only the latest revision per base title.
+
+    Non-mainline entries (Beta, Proto, Demo, Sample) are always kept unchanged.
+    For mainline entries, group by base name (stripping any '(Rev N)' tag) and
+    keep only the entry with the highest revision number. If only a base version
+    exists (no '(Rev N)' alternatives), that base version is kept.
+    """
+    keep: set[str] = set()
+    groups: dict[str, list[tuple[int, str]]] = {}  # base_name -> [(rev_num, filename)]
+
+    for fname in filenames:
+        if _NON_MAINLINE_RE.search(fname):
+            keep.add(fname)
+            continue
+        m = _REV_RE.search(fname)
+        if m:
+            rev = int(m.group(1))
+            base = _REV_RE.sub("", fname)
+        else:
+            rev = -1  # base version with no (Rev N) tag
+            base = fname
+        groups.setdefault(base, []).append((rev, fname))
+
+    for _base, versions in groups.items():
+        keep.add(max(versions, key=lambda x: x[0])[1])
+
+    return keep
+
+
 def file_matches(filename: str, finclude: list[str], fexclude: list[str]) -> bool:
     """Return True if filename passes the include/exclude regex filters."""
     if finclude and not any(re.search(p, filename) for p in finclude):
@@ -94,7 +128,7 @@ def resolve_root(path_or_url: str) -> Path:
     return Path(path_or_url)
 
 
-def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = []) -> tuple[int, int, int, int]:
+def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = [], latest_revisions: bool = False) -> tuple[int, int, int, int]:
     """Return (file_count, dir_count, total_bytes, max_depth) by walking metadata.tsv files."""
     files = dirs = total_bytes = max_depth = 0
 
@@ -106,19 +140,23 @@ def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = []
         if rel_dir and not dir_matches(rel_dir, dinclude, dexclude):
             continue
         with open(tsv_path, newline="", encoding="utf-8") as fh:
-            for row in csv.DictReader(fh, delimiter="\t"):
-                if row.get("File Size", "-") == "-":
-                    dirs += 1
-                else:
-                    if not file_matches(row["File Name"], finclude, fexclude):
-                        continue
-                    files += 1
-                    total_bytes += parse_size(row.get("File Size", ""))
+            rows = list(csv.DictReader(fh, delimiter="\t"))
+
+        file_rows = [r for r in rows if r.get("File Size", "-") != "-"]
+        dirs += len(rows) - len(file_rows)
+
+        file_rows = [r for r in file_rows if file_matches(r["File Name"], finclude, fexclude)]
+        if latest_revisions:
+            keep = latest_revisions_filter([r["File Name"] for r in file_rows])
+            file_rows = [r for r in file_rows if r["File Name"] in keep]
+
+        files += len(file_rows)
+        total_bytes += sum(parse_size(r.get("File Size", "")) for r in file_rows)
 
     return files, dirs, total_bytes, max_depth
 
 
-def build_tree(directory: Path, name: str, rel_path: str, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = []) -> dict:
+def build_tree(directory: Path, name: str, rel_path: str, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = [], latest_revisions: bool = False) -> dict:
     """Recursively build a stats tree for a directory node."""
     local_files = local_dirs = local_bytes = local_downloaded = 0
     children = []
@@ -126,21 +164,29 @@ def build_tree(directory: Path, name: str, rel_path: str, finclude: list[str] = 
     tsv_path = directory / "metadata.tsv"
     if tsv_path.exists():
         with open(tsv_path, newline="", encoding="utf-8") as fh:
-            for row in csv.DictReader(fh, delimiter="\t"):
-                if row.get("File Size", "-") == "-":
-                    local_dirs += 1
-                    child_name = row.get("File Name", "").rstrip("/")
-                    child_path = directory / child_name
-                    child_rel = f"{rel_path}/{child_name}" if rel_path else child_name
-                    if child_path.is_dir() and dir_matches(child_rel, dinclude, dexclude):
-                        children.append(build_tree(child_path, child_name, child_rel, finclude, fexclude, dinclude, dexclude))
-                else:
-                    if not file_matches(row["File Name"], finclude, fexclude):
-                        continue
-                    local_files += 1
-                    local_bytes += parse_size(row.get("File Size", ""))
-                    if (directory / row["File Name"]).exists():
-                        local_downloaded += 1
+            rows = list(csv.DictReader(fh, delimiter="\t"))
+
+        dir_rows = [r for r in rows if r.get("File Size", "-") == "-"]
+        file_rows = [r for r in rows if r.get("File Size", "-") != "-"]
+        local_dirs = len(dir_rows)
+
+        for row in dir_rows:
+            child_name = row.get("File Name", "").rstrip("/")
+            child_path = directory / child_name
+            child_rel = f"{rel_path}/{child_name}" if rel_path else child_name
+            if child_path.is_dir() and dir_matches(child_rel, dinclude, dexclude):
+                children.append(build_tree(child_path, child_name, child_rel, finclude, fexclude, dinclude, dexclude, latest_revisions))
+
+        file_rows = [r for r in file_rows if file_matches(r["File Name"], finclude, fexclude)]
+        if latest_revisions:
+            keep = latest_revisions_filter([r["File Name"] for r in file_rows])
+            file_rows = [r for r in file_rows if r["File Name"] in keep]
+
+        for row in file_rows:
+            local_files += 1
+            local_bytes += parse_size(row.get("File Size", ""))
+            if (directory / row["File Name"]).exists():
+                local_downloaded += 1
 
     total_files = local_files + sum(c["total_files"] for c in children)
     total_downloaded = local_downloaded + sum(c["downloaded_files"] for c in children)
@@ -269,9 +315,16 @@ def main() -> None:
         "--dexclude", nargs="+", metavar="PATTERN", default=[],
         help="exclude directories whose path (relative to root) matches any of these regexes (applied after --dinclude)",
     )
+    parser.add_argument(
+        "--latest-revisions",
+        action="store_true",
+        help="for each mainline title, keep only the highest (Rev N); "
+             "if no revision alternatives exist the base version is kept. "
+             "Applied after --finclude/--fexclude. Does not affect Beta/Proto/Demo/Sample entries.",
+    )
     args = parser.parse_args()
 
-    filtering = bool(args.finclude or args.fexclude or args.dinclude or args.dexclude)
+    filtering = bool(args.finclude or args.fexclude or args.dinclude or args.dexclude or args.latest_revisions)
 
     # Expand glob patterns for local paths; URLs pass through unchanged
     raw_paths: list[str] = []
@@ -308,7 +361,7 @@ def main() -> None:
     for i, (_raw, root, myrient_url) in enumerate(entries):
         if len(entries) > 1:
             print(f"\n[{i + 1} / {len(entries)}]")
-        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude, args.dinclude, args.dexclude)
+        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions)
         if filtering:
             total_file_count, _, total_bytes_all, _ = collect_stats(root)
         else:
@@ -341,7 +394,7 @@ def main() -> None:
 
     if args.expanded:
         trees = [
-            build_tree(root, root.resolve().name, "", args.finclude, args.fexclude, args.dinclude, args.dexclude)
+            build_tree(root, root.resolve().name, "", args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions)
             for _raw, root, _url in entries
         ]
 
