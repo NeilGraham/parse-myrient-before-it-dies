@@ -61,39 +61,135 @@ def fmt_size(n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# File filtering
+# File filtering — release parsing
 # ---------------------------------------------------------------------------
 
-_REV_RE = re.compile(r"\s*\(Rev\s+(\d+)\)", re.IGNORECASE)
-_NON_MAINLINE_RE = re.compile(r"\((Beta|Proto|Demo|Sample)\)", re.IGNORECASE)
+_TYPE_PRIORITY = {"official": 0, "beta": 1, "proto": 2, "demo": 3, "sample": 4}
+_PAREN_RE = re.compile(r"\(([^)]+)\)")
+_BASE_RE = re.compile(r"^(.*?)\s*\(")
+_REV_RE = re.compile(r"^Rev\s+(\d+)$", re.IGNORECASE)
+_DISC_RE = re.compile(r"^Disc\s+(\d+)", re.IGNORECASE)
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_BETA_RE = re.compile(r"^Beta(?:\s+(\d+))?$", re.IGNORECASE)
+_PROTO_RE = re.compile(r"^Proto(?:\s+(\d+))?$", re.IGNORECASE)
+_DEMO_RE = re.compile(r"^Demo(?:\s+(\d+))?$", re.IGNORECASE)
+_SAMPLE_RE = re.compile(r"^Sample$", re.IGNORECASE)
 
 
-def latest_revisions_filter(filenames: list[str]) -> set[str]:
-    """Return the subset of filenames keeping only the latest revision per base title.
+def _parse_release(filename: str) -> dict:
+    """Parse a ROM filename into structured components.
 
-    Non-mainline entries (Beta, Proto, Demo, Sample) are always kept unchanged.
-    For mainline entries, group by base name (stripping any '(Rev N)' tag) and
-    keep only the entry with the highest revision number. If only a base version
-    exists (no '(Rev N)' alternatives), that base version is kept.
+    Returns dict with keys: filename, base_title, regions, type,
+    rev, date, disc, type_number.
     """
-    keep: set[str] = set()
-    groups: dict[str, list[tuple[int, str]]] = {}  # base_name -> [(rev_num, filename)]
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    m = _BASE_RE.match(stem)
+    base_title = m.group(1).strip() if m else stem.strip()
 
-    for fname in filenames:
-        if _NON_MAINLINE_RE.search(fname):
-            keep.add(fname)
+    groups = _PAREN_RE.findall(stem)
+
+    regions: list[str] = []
+    release_type = "official"
+    rev = -1
+    date = ""
+    disc: int | None = None
+    type_number = -1
+    region_set = False
+
+    for g in groups:
+        g = g.strip()
+
+        rm = _REV_RE.match(g)
+        if rm:
+            rev = int(rm.group(1))
             continue
-        m = _REV_RE.search(fname)
-        if m:
-            rev = int(m.group(1))
-            base = _REV_RE.sub("", fname)
-        else:
-            rev = -1  # base version with no (Rev N) tag
-            base = fname
-        groups.setdefault(base, []).append((rev, fname))
+        if _DISC_RE.match(g):
+            disc = int(re.search(r"\d+", g).group())
+            continue
+        if _DATE_RE.match(g):
+            date = g
+            continue
+        bm = _BETA_RE.match(g)
+        if bm:
+            release_type = "beta"
+            type_number = int(bm.group(1)) if bm.group(1) else -1
+            continue
+        pm = _PROTO_RE.match(g)
+        if pm:
+            release_type = "proto"
+            type_number = int(pm.group(1)) if pm.group(1) else -1
+            continue
+        dm = _DEMO_RE.match(g)
+        if dm:
+            release_type = "demo"
+            type_number = int(dm.group(1)) if dm.group(1) else -1
+            continue
+        if _SAMPLE_RE.match(g):
+            release_type = "sample"
+            continue
 
-    for _base, versions in groups.items():
-        keep.add(max(versions, key=lambda x: x[0])[1])
+        # First unclassified group is the region
+        if not region_set:
+            regions = [r.strip() for r in g.split(", ")] if ", " in g else [g]
+            region_set = True
+
+    return {
+        "filename": filename,
+        "base_title": base_title,
+        "regions": regions,
+        "type": release_type,
+        "rev": rev,
+        "date": date,
+        "disc": disc,
+        "type_number": type_number,
+    }
+
+
+def latest_revisions_filter(filenames: list[str], preferred_regions: list[str] = []) -> set[str]:
+    """Return the subset of filenames to keep, selecting the best version per title.
+
+    Priority: official release (highest Rev N) > Beta (latest date / highest
+    number) > Proto (same) > Demo > Sample.
+
+    When *preferred_regions* is given, among equally-versioned entries the first
+    matching region wins.  Without it, all region variants of the best version
+    are kept.  Multi-disc entries (Disc 1, Disc 2, …) are always kept together.
+    """
+    parsed = [_parse_release(f) for f in filenames]
+
+    # Group by base title
+    games: dict[str, list[dict]] = {}
+    for p in parsed:
+        games.setdefault(p["base_title"], []).append(p)
+
+    keep: set[str] = set()
+
+    for _title, entries in games.items():
+        # 1. Best (lowest-numbered) type available
+        best_type_val = min(_TYPE_PRIORITY[e["type"]] for e in entries)
+        type_entries = [e for e in entries if _TYPE_PRIORITY[e["type"]] == best_type_val]
+
+        # 2. Version sort key (higher tuple = better)
+        def version_key(e: dict) -> tuple:
+            if e["type"] == "official":
+                return (e["rev"],)
+            return (e["type_number"], e["date"])
+
+        # 3. Narrow to preferred region (if given)
+        if preferred_regions:
+            for pref in preferred_regions:
+                regional = [e for e in type_entries if pref in e["regions"]]
+                if regional:
+                    type_entries = regional
+                    break
+
+        # 4. Pick the best version among remaining candidates
+        best_vk = max(version_key(e) for e in type_entries)
+
+        # 5. Keep all entries with that version (preserves every disc)
+        for e in type_entries:
+            if version_key(e) == best_vk:
+                keep.add(e["filename"])
 
     return keep
 
@@ -128,7 +224,7 @@ def resolve_root(path_or_url: str) -> Path:
     return Path(path_or_url)
 
 
-def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = [], latest_revisions: bool = False) -> tuple[int, int, int, int]:
+def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = [], latest_revisions: bool = False, preferred_regions: list[str] = []) -> tuple[int, int, int, int]:
     """Return (file_count, dir_count, total_bytes, max_depth) by walking metadata.tsv files."""
     files = dirs = total_bytes = max_depth = 0
 
@@ -147,7 +243,7 @@ def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = []
 
         file_rows = [r for r in file_rows if file_matches(r["File Name"], finclude, fexclude)]
         if latest_revisions:
-            keep = latest_revisions_filter([r["File Name"] for r in file_rows])
+            keep = latest_revisions_filter([r["File Name"] for r in file_rows], preferred_regions)
             file_rows = [r for r in file_rows if r["File Name"] in keep]
 
         files += len(file_rows)
@@ -156,7 +252,7 @@ def collect_stats(root: Path, finclude: list[str] = [], fexclude: list[str] = []
     return files, dirs, total_bytes, max_depth
 
 
-def build_tree(directory: Path, name: str, rel_path: str, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = [], latest_revisions: bool = False) -> dict:
+def build_tree(directory: Path, name: str, rel_path: str, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = [], latest_revisions: bool = False, preferred_regions: list[str] = []) -> dict:
     """Recursively build a stats tree for a directory node."""
     local_files = local_dirs = local_bytes = local_downloaded = 0
     children = []
@@ -175,11 +271,11 @@ def build_tree(directory: Path, name: str, rel_path: str, finclude: list[str] = 
             child_path = directory / child_name
             child_rel = f"{rel_path}/{child_name}" if rel_path else child_name
             if child_path.is_dir() and dir_matches(child_rel, dinclude, dexclude):
-                children.append(build_tree(child_path, child_name, child_rel, finclude, fexclude, dinclude, dexclude, latest_revisions))
+                children.append(build_tree(child_path, child_name, child_rel, finclude, fexclude, dinclude, dexclude, latest_revisions, preferred_regions))
 
         file_rows = [r for r in file_rows if file_matches(r["File Name"], finclude, fexclude)]
         if latest_revisions:
-            keep = latest_revisions_filter([r["File Name"] for r in file_rows])
+            keep = latest_revisions_filter([r["File Name"] for r in file_rows], preferred_regions)
             file_rows = [r for r in file_rows if r["File Name"] in keep]
 
         for row in file_rows:
@@ -318,13 +414,23 @@ def main() -> None:
     parser.add_argument(
         "--latest-revisions",
         action="store_true",
-        help="for each mainline title, keep only the highest (Rev N); "
-             "if no revision alternatives exist the base version is kept. "
-             "Applied after --finclude/--fexclude. Does not affect Beta/Proto/Demo/Sample entries.",
+        help="for each title, keep only the best version using priority: "
+             "official release (highest Rev N) > Beta (latest date/number) > "
+             "Proto (latest date/number) > Demo > Sample. "
+             "Applied after --finclude/--fexclude.",
+    )
+    parser.add_argument(
+        "--preferred-regions",
+        nargs="+",
+        metavar="REGION",
+        default=[],
+        help="when used with --latest-revisions, prefer these regions in order "
+             "(e.g. --preferred-regions World USA); if no preferred region is "
+             "available, the best remaining region is kept",
     )
     args = parser.parse_args()
 
-    filtering = bool(args.finclude or args.fexclude or args.dinclude or args.dexclude or args.latest_revisions)
+    filtering = bool(args.finclude or args.fexclude or args.dinclude or args.dexclude or args.latest_revisions or args.preferred_regions)
 
     # Expand glob patterns for local paths; URLs pass through unchanged
     raw_paths: list[str] = []
@@ -361,7 +467,7 @@ def main() -> None:
     for i, (_raw, root, myrient_url) in enumerate(entries):
         if len(entries) > 1:
             print(f"\n[{i + 1} / {len(entries)}]")
-        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions)
+        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions, args.preferred_regions)
         if filtering:
             total_file_count, _, total_bytes_all, _ = collect_stats(root)
         else:
@@ -394,7 +500,7 @@ def main() -> None:
 
     if args.expanded:
         trees = [
-            build_tree(root, root.resolve().name, "", args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions)
+            build_tree(root, root.resolve().name, "", args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions, args.preferred_regions)
             for _raw, root, _url in entries
         ]
 

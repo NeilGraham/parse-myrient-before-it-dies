@@ -82,7 +82,7 @@ def run_crawl(root: Path) -> None:
 # Download list
 # ---------------------------------------------------------------------------
 
-def collect_downloads(root: Path, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = [], latest_revisions: bool = False) -> list[tuple[str, Path, int]]:
+def collect_downloads(root: Path, finclude: list[str] = [], fexclude: list[str] = [], dinclude: list[str] = [], dexclude: list[str] = [], latest_revisions: bool = False, preferred_regions: list[str] = []) -> list[tuple[str, Path, int]]:
     """Return (url, local_path, size_bytes) triples for every file entry under root."""
     items: list[tuple[str, Path, int]] = []
     for tsv_path in sorted(root.rglob("metadata.tsv")):
@@ -96,7 +96,7 @@ def collect_downloads(root: Path, finclude: list[str] = [], fexclude: list[str] 
         file_rows = [r for r in rows if r.get("File Size", "-") != "-"]
         file_rows = [r for r in file_rows if file_matches(r["File Name"], finclude, fexclude)]
         if latest_revisions:
-            keep = latest_revisions_filter([r["File Name"] for r in file_rows])
+            keep = latest_revisions_filter([r["File Name"] for r in file_rows], preferred_regions)
             file_rows = [r for r in file_rows if r["File Name"] in keep]
 
         for row in file_rows:
@@ -205,9 +205,19 @@ def main() -> None:
     parser.add_argument(
         "--latest-revisions",
         action="store_true",
-        help="for each mainline title, download only the highest (Rev N); "
-             "if no revision alternatives exist the base version is downloaded. "
-             "Applied after --finclude/--fexclude. Does not affect Beta/Proto/Demo/Sample entries.",
+        help="for each title, download only the best version using priority: "
+             "official release (highest Rev N) > Beta (latest date/number) > "
+             "Proto (latest date/number) > Demo > Sample. "
+             "Applied after --finclude/--fexclude.",
+    )
+    parser.add_argument(
+        "--preferred-regions",
+        nargs="+",
+        metavar="REGION",
+        default=[],
+        help="when used with --latest-revisions, prefer these regions in order "
+             "(e.g. --preferred-regions World USA); if no preferred region is "
+             "available, the best remaining region is kept",
     )
     parser.add_argument(
         "--select",
@@ -243,15 +253,15 @@ def main() -> None:
             sys.exit(1)
 
     # --- Step 2: Collect downloads and compute pending/done per target ---
-    filtering = bool(args.finclude or args.fexclude or args.dinclude or args.dexclude or args.latest_revisions)
+    filtering = bool(args.finclude or args.fexclude or args.dinclude or args.dexclude or args.latest_revisions or args.preferred_regions)
     target_stats = []
     for _raw, root, myrient_url in targets:
-        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions)
+        file_count, dir_count, total_bytes, max_depth = collect_stats(root, args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions, args.preferred_regions)
         if filtering:
             total_file_count, _, total_bytes_all, _ = collect_stats(root)
         else:
             total_file_count, total_bytes_all = file_count, total_bytes
-        downloads = collect_downloads(root, args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions)
+        downloads = collect_downloads(root, args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions, args.preferred_regions)
         pending_items   = [(url, path, sz) for url, path, sz in downloads if not path.exists()]
         done_count      = len(downloads) - len(pending_items)
         pending_bytes   = sum(sz for _, _, sz in pending_items)

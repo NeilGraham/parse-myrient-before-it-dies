@@ -77,8 +77,13 @@ class FileSelector(App[list[int] | None]):
         selections: list[Selection[int]] = []
         for idx, (_url, path, size) in enumerate(self._items):
             name = path.name
+            try:
+                rel_dir = str(path.parent.relative_to(self._root))
+            except ValueError:
+                rel_dir = str(path.parent)
             size_str = fmt_size(size)
-            label = f"{name}  [dim]{size_str}[/]"
+            dir_part = f"  [dim]{rel_dir}/[/]" if rel_dir and rel_dir != "." else ""
+            label = f"{name}{dir_part}  [dim]{size_str}[/]"
             selections.append(Selection(label, idx, False))
         yield SelectionList[int](*selections)
         yield Label("", id="path-bar")
