@@ -21,9 +21,12 @@ import argparse
 import csv
 import glob as glob_mod
 import queue
+import shlex
 import subprocess
 import sys
 import threading
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -104,6 +107,28 @@ def collect_downloads(root: Path, finclude: list[str] = [], fexclude: list[str] 
     return items
 
 
+def load_downloaded(root: Path) -> set[str]:
+    """Load filenames from all downloaded.tsv files under root."""
+    done: set[str] = set()
+    for tsv_path in root.rglob("downloaded.tsv"):
+        with open(tsv_path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            for row in reader:
+                done.add(row["File Name"])
+    return done
+
+
+def record_downloaded(dest: Path) -> None:
+    """Append an entry to downloaded.tsv next to dest."""
+    tsv_path = dest.parent / "downloaded.tsv"
+    write_header = not tsv_path.exists()
+    with open(tsv_path, "a", newline="", encoding="utf-8") as fh:
+        if write_header:
+            fh.write("File Name\tDate\n")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        fh.write(f"{dest.name}\t{now}\n")
+
+
 # ---------------------------------------------------------------------------
 # Single-file downloader
 # ---------------------------------------------------------------------------
@@ -158,6 +183,35 @@ def download_file(
     except Exception as exc:
         # Treat unexpected errors as stalls — safer to retry than to discard
         raise _Stalled(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Post-download processing
+# ---------------------------------------------------------------------------
+
+def extract_zip(zip_path: Path) -> list[Path]:
+    """Extract zip_path into its parent dir, remove the archive, return extracted file paths."""
+    target_dir = zip_path.parent
+    with zipfile.ZipFile(zip_path) as zf:
+        members = zf.namelist()
+        zf.extractall(target_dir)
+    zip_path.unlink()
+    return [target_dir / m for m in members if not m.endswith("/")]
+
+
+def run_exec(cmd_template: str, file_path: Path) -> tuple[bool, str]:
+    """Run user command with {} replaced by file_path and {dir} by its parent. Returns (ok, error_msg)."""
+    quoted_path = shlex.quote(str(file_path))
+    quoted_dir = shlex.quote(str(file_path.parent))
+    if "{}" in cmd_template or "{dir}" in cmd_template:
+        cmd_str = cmd_template.replace("{}", quoted_path).replace("{dir}", quoted_dir)
+    else:
+        cmd_str = f"{cmd_template} {quoted_path}"
+    result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        lines = (result.stderr or result.stdout or "").strip().splitlines()
+        return False, lines[-1] if lines else f"exit code {result.returncode}"
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +278,18 @@ def main() -> None:
         action="store_true",
         help="open an interactive TUI to select which files to download (requires textual)",
     )
+    parser.add_argument(
+        "--extract",
+        action="store_true",
+        help="extract .zip files after download, then remove the archive",
+    )
+    parser.add_argument(
+        "--exec",
+        metavar="CMD",
+        dest="exec_cmd",
+        help='run CMD on each file after download (use {} for file path and '
+             '{dir} for its directory, e.g. --exec "extract-xiso -r {}")',
+    )
     args = parser.parse_args()
     n_workers = max(1, min(32, args.workers))
 
@@ -253,6 +319,15 @@ def main() -> None:
             sys.exit(1)
 
     # --- Step 2: Collect downloads and compute pending/done per target ---
+    use_downloaded_tsv = bool(args.extract or args.exec_cmd)
+    downloaded: set[str] = set()
+    if use_downloaded_tsv:
+        for _raw, root, _url in targets:
+            downloaded |= load_downloaded(root)
+
+    def is_done(path: Path) -> bool:
+        return path.exists() or (use_downloaded_tsv and path.name in downloaded)
+
     filtering = bool(args.finclude or args.fexclude or args.dinclude or args.dexclude or args.latest_revisions or args.preferred_regions)
     target_stats = []
     for _raw, root, myrient_url in targets:
@@ -262,7 +337,7 @@ def main() -> None:
         else:
             total_file_count, total_bytes_all = file_count, total_bytes
         downloads = collect_downloads(root, args.finclude, args.fexclude, args.dinclude, args.dexclude, args.latest_revisions, args.preferred_regions)
-        pending_items   = [(url, path, sz) for url, path, sz in downloads if not path.exists()]
+        pending_items   = [(url, path, sz) for url, path, sz in downloads if not is_done(path)]
         done_count      = len(downloads) - len(pending_items)
         pending_bytes   = sum(sz for _, _, sz in pending_items)
         target_stats.append((root, myrient_url, file_count, total_file_count, dir_count,
@@ -293,7 +368,7 @@ def main() -> None:
             downloads = [(u, p, s) for u, p, s in downloads if (u, str(p)) in selected_set]
             file_count = len(downloads)
             total_bytes = sum(s for _, _, s in downloads)
-            pending_items = [(u, p, s) for u, p, s in downloads if not p.exists()]
+            pending_items = [(u, p, s) for u, p, s in downloads if not is_done(p)]
             done_count = file_count - len(pending_items)
             pending_bytes = sum(s for _, _, s in pending_items)
             new_target_stats.append((root, myrient_url, file_count, total_file_count, dir_count,
@@ -352,7 +427,7 @@ def main() -> None:
     for _, _, _, _, _, _, _, _, downloads, _, _, _ in target_stats:
         all_downloads.extend(downloads)
 
-    pending = [(url, path, sz) for url, path, sz in all_downloads if not path.exists()]
+    pending = [(url, path, sz) for url, path, sz in all_downloads if not is_done(path)]
     already_done = len(all_downloads) - len(pending)
 
     console.print()
@@ -397,8 +472,42 @@ def main() -> None:
 
                 with lock:
                     if ok is True:
-                        completed += 1
-                        progress.console.print(f"  [green]✓[/] {dest.name}")
+                        post_ok = True
+                        result_files = [dest]
+
+                        # --- Extraction ---
+                        if args.extract and dest.suffix.lower() == ".zip":
+                            try:
+                                result_files = extract_zip(dest)
+                                progress.console.print(
+                                    f"  [blue]⤷ extracted {len(result_files)} file(s)[/] {dest.name}"
+                                )
+                            except Exception as exc:
+                                post_ok = False
+                                progress.console.print(
+                                    f"  [red]✗ extract failed:[/] {dest.name}: {exc}"
+                                )
+
+                        # --- Exec ---
+                        if post_ok and args.exec_cmd:
+                            for fpath in result_files:
+                                cmd_ok, cmd_err = run_exec(args.exec_cmd, fpath)
+                                if cmd_ok:
+                                    progress.console.print(f"  [blue]⤷ exec ok[/] {fpath.name}")
+                                else:
+                                    post_ok = False
+                                    progress.console.print(
+                                        f"  [red]✗ exec failed:[/] {fpath.name}: {cmd_err}"
+                                    )
+                                    break
+
+                        if post_ok:
+                            if use_downloaded_tsv:
+                                record_downloaded(dest)
+                            completed += 1
+                            progress.console.print(f"  [green]✓[/] {dest.name}")
+                        else:
+                            failed += 1
                     elif ok is None and attempt < MAX_ATTEMPTS:
                         # Stalled — push back onto the end of the queue
                         work_q.put((url, dest, attempt + 1))

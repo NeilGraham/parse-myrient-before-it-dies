@@ -55,7 +55,7 @@ class FileSelector(App[list[int] | None]):
 
     BINDINGS = [
         Binding("a", "toggle_all", "Toggle all"),
-        Binding("enter", "confirm", "Confirm"),
+        Binding("ctrl+d", "confirm", "Confirm", show=True),
         Binding("escape", "quit_app", "Quit"),
     ]
 
