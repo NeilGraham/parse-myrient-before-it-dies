@@ -196,7 +196,7 @@ def latest_revisions_filter(filenames: list[str], preferred_regions: list[str] =
 
 def file_matches(filename: str, finclude: list[str], fexclude: list[str]) -> bool:
     """Return True if filename passes the include/exclude regex filters."""
-    if finclude and not any(re.search(p, filename) for p in finclude):
+    if finclude and not all(re.search(p, filename) for p in finclude):
         return False
     if any(re.search(p, filename) for p in fexclude):
         return False
@@ -396,12 +396,12 @@ def main() -> None:
              " (descending except name); e.g. --sort-by done size name",
     )
     parser.add_argument(
-        "--finclude", nargs="+", metavar="PATTERN", default=[],
-        help="only count files whose name matches any of these regexes",
+        "--finclude", nargs="+", action="extend", metavar="PATTERN", default=[],
+        help="only count files whose name matches ALL of these regexes; may be specified multiple times",
     )
     parser.add_argument(
-        "--fexclude", nargs="+", metavar="PATTERN", default=[],
-        help="exclude files whose name matches any of these regexes (applied after --finclude)",
+        "--fexclude", nargs="+", action="extend", metavar="PATTERN", default=[],
+        help="exclude files whose name matches any of these regexes (applied after --finclude); may be specified multiple times",
     )
     parser.add_argument(
         "--dinclude", nargs="+", metavar="PATTERN", default=[],

@@ -242,12 +242,12 @@ def main() -> None:
         help=f"number of concurrent download threads (default {DEFAULT_WORKERS})",
     )
     parser.add_argument(
-        "--finclude", nargs="+", metavar="PATTERN", default=[],
-        help="only download files whose name matches any of these regexes",
+        "--finclude", nargs="+", action="extend", metavar="PATTERN", default=[],
+        help="only download files whose name matches ALL of these regexes; may be specified multiple times",
     )
     parser.add_argument(
-        "--fexclude", nargs="+", metavar="PATTERN", default=[],
-        help="exclude files whose name matches any of these regexes (applied after --finclude)",
+        "--fexclude", nargs="+", action="extend", metavar="PATTERN", default=[],
+        help="exclude files whose name matches any of these regexes (applied after --finclude); may be specified multiple times",
     )
     parser.add_argument(
         "--dinclude", nargs="+", metavar="PATTERN", default=[],
