@@ -207,9 +207,10 @@ def run_exec(cmd_template: str, file_path: Path) -> tuple[bool, str]:
         cmd_str = cmd_template.replace("{}", quoted_path).replace("{dir}", quoted_dir)
     else:
         cmd_str = f"{cmd_template} {quoted_path}"
-    result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True)
+    result = subprocess.run(cmd_str, shell=True, capture_output=True)
     if result.returncode != 0:
-        lines = (result.stderr or result.stdout or "").strip().splitlines()
+        output = (result.stderr or result.stdout or b"").decode("utf-8", errors="replace").strip()
+        lines = output.splitlines()
         return False, lines[-1] if lines else f"exit code {result.returncode}"
     return True, ""
 
@@ -470,37 +471,40 @@ def main() -> None:
                     ok = None  # will re-queue if attempts remain
                 progress.remove_task(task_id)
 
-                with lock:
-                    if ok is True:
-                        post_ok = True
-                        result_files = [dest]
+                # --- Post-processing (outside lock — runs in parallel across workers) ---
+                post_ok = True
+                post_lines: list[str] = []  # status lines to print, collected then flushed under lock
+                result_files = [dest]
 
-                        # --- Extraction ---
-                        if args.extract and dest.suffix.lower() == ".zip":
-                            try:
-                                result_files = extract_zip(dest)
-                                progress.console.print(
-                                    f"  [blue]⤷ extracted {len(result_files)} file(s)[/] {dest.name}"
-                                )
-                            except Exception as exc:
+                if ok is True:
+                    # Extraction
+                    if args.extract and dest.suffix.lower() == ".zip":
+                        try:
+                            result_files = extract_zip(dest)
+                            post_lines.append(
+                                f"  [blue]⤷ extracted {len(result_files)} file(s)[/] {dest.name}"
+                            )
+                        except Exception as exc:
+                            post_ok = False
+                            post_lines.append(f"  [red]✗ extract failed:[/] {dest.name}: {exc}")
+
+                    # Exec
+                    if post_ok and args.exec_cmd:
+                        for fpath in result_files:
+                            cmd_ok, cmd_err = run_exec(args.exec_cmd, fpath)
+                            if cmd_ok:
+                                post_lines.append(f"  [blue]⤷ exec ok[/] {fpath.name}")
+                            else:
                                 post_ok = False
-                                progress.console.print(
-                                    f"  [red]✗ extract failed:[/] {dest.name}: {exc}"
+                                post_lines.append(
+                                    f"  [red]✗ exec failed:[/] {fpath.name}: {cmd_err}"
                                 )
+                                break
 
-                        # --- Exec ---
-                        if post_ok and args.exec_cmd:
-                            for fpath in result_files:
-                                cmd_ok, cmd_err = run_exec(args.exec_cmd, fpath)
-                                if cmd_ok:
-                                    progress.console.print(f"  [blue]⤷ exec ok[/] {fpath.name}")
-                                else:
-                                    post_ok = False
-                                    progress.console.print(
-                                        f"  [red]✗ exec failed:[/] {fpath.name}: {cmd_err}"
-                                    )
-                                    break
-
+                with lock:
+                    for line in post_lines:
+                        progress.console.print(line)
+                    if ok is True:
                         if post_ok:
                             if use_downloaded_tsv:
                                 record_downloaded(dest)
